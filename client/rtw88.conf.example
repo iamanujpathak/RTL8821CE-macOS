@@ -1,0 +1,32 @@
+# rtw88.conf — RTW88Client settings.  Copy to /usr/local/etc/rtw88.conf and edit.
+# Lines are `key = value`; '#' starts a comment. CLI flags override these.
+
+# --- Known networks ---------------------------------------------------------
+# List one or MORE networks. At startup the client scans and joins the
+# strongest one that's in range, so the same config works at home, the office,
+# or off your phone's hotspot. Each `network =` starts an entry; the following
+# `password =` is its passphrase (omit/blank for an open network).
+
+network  = MyHomeWiFi
+password = my-home-passphrase
+
+network  = Phone Hotspot
+password = hotspot-passphrase
+
+# network  = OfficeOpenWiFi      # open network: no password line
+
+# --- Radio / mode -----------------------------------------------------------
+# Band to scan: 2.4 | 5 | both   (default both)
+band     = both
+
+# Integration mode:
+#   eth   join, then present a real macOS Ethernet interface (enX); macOS runs its
+#         own DHCP/IP on it and routes the whole system through it (default)
+#   scan  just list visible networks, don't connect
+mode     = eth
+
+# --- Optional static IP (otherwise learned via DHCP automatically) ----------
+# ip      = 192.168.0.50
+# netmask = 255.255.255.0
+# gateway = 192.168.0.1
+# dns     = 1.1.1.1
