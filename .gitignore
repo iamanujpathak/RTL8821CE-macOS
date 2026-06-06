@@ -1,0 +1,21 @@
+# Build output (objects in build/{client,server}, binary in build/client,
+# RTW88Server.kext in dist/)
+/build/
+*.o
+*.kext
+*.dSYM
+*.partial.o
+
+# Logs / HIL capture
+*.log
+.stream.log
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+
+# Claude Code local state
+.claude/
+
+# Local reference material (FreeBSD LinuxKPI / rtw88 sources, for porting reference only)
+/reference/
