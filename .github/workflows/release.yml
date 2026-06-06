@@ -1,0 +1,47 @@
+name: Build & Release
+
+# Build the RTW88Server.kext + RTW88Client on every push to main and publish
+# them as a public GitHub Release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build RTW88Server.kext
+        run: bash server/build.sh
+
+      - name: Build RTW88Client
+        run: bash client/build.sh
+
+      - name: Package artifacts
+        run: |
+          set -e
+          mkdir -p out
+          # ad-hoc sign so it loads on a local machine (OpenCore doesn't need a Developer ID)
+          codesign --force --sign - dist/RTW88Server.kext || true
+          # a .kext is a bundle (directory) — zip it preserving the bundle layout
+          ditto -c -k --sequesterRsrc --keepParent dist/RTW88Server.kext out/RTW88Server.kext.zip
+          cp build/client/RTW88Client out/RTW88Client
+          chmod +x out/RTW88Client
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="v0.1.${{ github.run_number }}"
+          gh release create "$TAG" \
+            out/RTW88Server.kext.zip \
+            out/RTW88Client \
+            --title "RTW88 $TAG" \
+            --target "${{ github.sha }}" \
+            --generate-notes
