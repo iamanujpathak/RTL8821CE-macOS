@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.rtw88.rtwd</string>
+
+	<!-- rtwd: the HeliPort-style control daemon. Runs as root (needs the RTW88Server
+	     user client + ipconfig for DHCP) and exposes scan/connect/disconnect/status
+	     over /var/run/rtw88d.sock for the unprivileged menu-bar app to drive.
+
+	     NOTE: install this INSTEAD of com.rtw88.client.plist if you want to drive
+	     Wi-Fi from the GUI rather than auto-connecting to a config file at boot. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/rtwd</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- restart if it exits (e.g. kext not ready yet at boot). -->
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>StandardOutPath</key>
+	<string>/var/log/rtw88d.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/rtw88d.log</string>
+</dict>
+</plist>

@@ -19,3 +19,6 @@
 
 # Local reference material (FreeBSD LinuxKPI / rtw88 sources, for porting reference only)
 /reference/
+
+# CI release staging
+out/

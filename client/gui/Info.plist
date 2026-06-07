@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>RTW88 Wi-Fi</string>
+	<key>CFBundleDisplayName</key>
+	<string>RTW88 Wi-Fi</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.rtw88.menu</string>
+	<key>CFBundleExecutable</key>
+	<string>RTW88Menu</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- menu-bar agent: no Dock icon, no main window -->
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>
