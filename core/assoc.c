@@ -51,7 +51,12 @@ static u32 build_auth_req(u8 *buf, const u8 *sa, const u8 *bssid)
  * rate-floors us to VHT-MCS0 + retransmits (the retry storm). Drop the VHT IE so
  * the AP is forced to 20 MHz HT frames we fully receive. Flip back to 1 ONLY once
  * the 80 MHz baseband path is ported. */
-#define RTW_ADVERTISE_VHT 1
+/* 0 = don't advertise VHT. With the ASPM/SIG-B fix RX now flows, and the health log
+ * shows ~36% of the AP's SNs simply never arrive (err=0, ringFull=0) — the signature of
+ * the AP sending 40/80MHz VHT PPDUs our 20MHz-only baseband can't demodulate. Advertising
+ * VHT implies >=80MHz; dropping it (HT cap is 20MHz-only) forces the AP to 20MHz HT we can
+ * fully receive. Flip back to 1 only once the 40/80MHz baseband path (set_channel_bb) lands. */
+#define RTW_ADVERTISE_VHT 0
 
 static u32 build_assoc_req(u8 *buf, const u8 *sa, const u8 *bssid,
                            const char *ssid, u8 ssid_len, int five_ghz)

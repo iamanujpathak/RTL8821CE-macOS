@@ -196,7 +196,7 @@ static volatile uint64_t gRateMin = 0xff;   /* lowest RX PHY-rate code — detec
 /* parse-drop breakdown (which path drops the ~14% gDrxParse): */
 static volatile uint64_t gPShort, gPLlc, gPAmsdu, gPBig, gPHtcFix;   /* gPHtcFix = recovered via +/-HTC retry */
 /* reorder activity for the health log: */
-static volatile uint64_t gReordBuf, gReordTo;
+static volatile uint64_t gReordBuf, gReordTo, gReordRel;   /* gReordRel = frames released in order */
 static volatile uint32_t gReordActiveMask;
 static volatile uint64_t gBigJump;   /* per-TID seq jumps > a BA window: AP serving others / idle gap, NOT our loss */
 static volatile uint32_t gTidMask;
@@ -874,6 +874,7 @@ void RTW88Ethernet::deliverSlot(ReorderTid *rt, uint32_t idx)
     deliverMpdu(rt->store + (uint64_t)idx * RTW_REORDER_SLOT_SZ, rt->len[idx]);
     rt->occ[idx] = false;
     if (rt->stored) rt->stored--;
+    gReordRel++;
 }
 
 uint32_t RTW88Ethernet::reorderDrainReady(ReorderTid *rt)
@@ -910,6 +911,7 @@ void RTW88Ethernet::reorderInsert(uint8_t tid, uint16_t sn, const uint8_t *f, ui
     if (rt->occ[index]) return;                                        /* (C) duplicate */
     if (sn == rt->head && rt->stored == 0) {                           /* (D) fast path */
         rt->head = rtw_sn_inc(rt->head);
+        gReordRel++;
         deliverMpdu(f, len);
         return;
     }
@@ -1182,12 +1184,12 @@ void RTW88Ethernet::rxLoop()
                 lastHealthNs = nowNs;
                 uint64_t n = gRateN;
                 IOLog("RTW-health: rx=%llu err=%llu retry=%llu rate[avg=%llu max=%llu min=%llu] "
-                      "ringFull=%llu maxDepth=%llu txDrop=%llu | reorder[active=0x%x buf=%llu timeout=%llu] "
+                      "ringFull=%llu maxDepth=%llu txDrop=%llu | reorder[active=0x%x rel=%llu buf=%llu timeout=%llu] "
                       "| parse=%llu{htcfix=%llu llc=%llu amsdu=%llu short=%llu big=%llu}\n",
                       gDrx, gDrxErr, gDrxRetry,
                       n ? gRateSum / n : 0, gRateMax, n ? gRateMin : 0,
                       gRxRingFull, gDrxMaxDepth, gDtxDrop,
-                      gReordActiveMask, gReordBuf, gReordTo,
+                      gReordActiveMask, gReordRel, gReordBuf, gReordTo,
                       gDrxParse, gPHtcFix, gPLlc, gPAmsdu, gPShort, gPBig);
             }
         }

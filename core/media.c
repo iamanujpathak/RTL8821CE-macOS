@@ -141,7 +141,8 @@ void media_connect(struct rtw_dev *rtwdev, const u8 *bssid, u8 mac_id, u8 channe
         if (!five) mask |= 0x0000000f;
         mode = "legacy";
     }
-    fw_ra_info(rtwdev, mac_id, raid, mask, 0 /*20MHz*/, 0 /*no SGI*/, vht_en);
+    /* SGI on: we advertise Short-GI-20 in the HT cap; lifts HT MCS7 @20MHz 65->72.2 Mbps. */
+    fw_ra_info(rtwdev, mac_id, raid, mask, 0 /*20MHz*/, 1 /*SGI*/, vht_en);
 
     /* publish the chosen rate table id so the TX data paths stamp it into every data
      * descriptor (must match the raid the firmware RA is running for this MACID). */
