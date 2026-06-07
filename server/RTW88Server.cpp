@@ -166,6 +166,7 @@ private:
     uint32_t reorderTimeoutAll();
     inline uint32_t mmioR32(uint32_t off) { return *(volatile uint32_t *)(fMmio + off); }
     inline void     mmioW16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(fMmio + off) = v; }
+    inline void     mmioW32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fMmio + off) = v; }
 };
 
 #define RTK_PCI_TXBD_IDX_BEQ_K    0x3A8
@@ -201,6 +202,10 @@ static volatile uint64_t gReordBuf, gReordTo, gReordRel;   /* gReordRel = frames
  * occupied slot. HIGH stale/dup => AP retransmitting things we HAVE (Block-Ack/TX issue);
  * LOW stale/dup + HIGH timeout => frames genuinely never arrive (RX sensitivity). */
 static volatile uint64_t gReordStale, gReordDup;
+/* DIG (dynamic initial gain) state for the health log: gDigFa = OFDM false-alarm count
+ * per interval (high => RX gain too sensitive: saturation/noise eats frames at close range),
+ * gDigIgi = current initial gain (REG 0xc50[6:0]). */
+static volatile uint64_t gDigFa; static volatile uint32_t gDigIgi;
 static volatile uint32_t gReordActiveMask;
 static volatile uint64_t gBigJump;   /* per-TID seq jumps > a BA window: AP serving others / idle gap, NOT our loss */
 static volatile uint32_t gTidMask;
@@ -1177,6 +1182,32 @@ void RTW88Ethernet::rxLoop()
         reorderTimeoutAll();
         if (fPendingFlush && fNetif) { fNetif->flushInputQueue(); fPendingFlush = false; }
 
+        /* DIG: dynamic initial RX gain. The AGC table leaves IGI static; at close range a
+         * too-sensitive gain saturates the receiver so frames go undetected (clean but absent
+         * — the measured ~40% loss). Every 2s, read the OFDM false-alarm count and nudge IGI
+         * (REG 0xc50[6:0]) toward a low-FA target, clamped [0x1c,0x3e]. Self-correcting +
+         * bounded, so a wrong start can't run away. Thresholds from rtw88 rtw_phy_dig. */
+        {
+            static uint64_t lastDigNs = 0;
+            static bool     digInit = false;
+            static uint32_t igi = 0x20;
+            uint64_t a = 0, nowNs = 0;
+            clock_get_uptime(&a); absolutetime_to_nanoseconds(a, &nowNs);
+            if (!digInit) { igi = mmioR32(0xc50) & 0x7f; digInit = true; }
+            if (nowNs - lastDigNs > 2000000000ull) {
+                lastDigNs = nowNs;
+                uint32_t fa = mmioR32(0x0f48) & 0xffff;            /* REG_FA_OFDM */
+                uint32_t fas = mmioR32(0x09a4);                    /* REG_FAS: reset FA counters */
+                mmioW32(0x09a4, fas |  (1u << 17));
+                mmioW32(0x09a4, fas & ~(1u << 17));
+                if      (fa > 750 && igi < 0x3e) igi += 2;
+                else if (fa > 250 && igi < 0x3e) igi += 1;
+                else if (fa < 250 && igi > 0x1c) igi -= 1;
+                mmioW32(0xc50, (mmioR32(0xc50) & ~0x7fu) | (igi & 0x7f));
+                gDigFa = fa; gDigIgi = igi;
+            }
+        }
+
         /* passive RX health snapshot every ~10s -> system log (reads counters; no behavior
          * change). rate codes: <12 legacy/CCK, 12-27 HT, >=44 VHT. parse breakdown: htcfix =
          * frames recovered via the +/-HTC retry; llc/amsdu/short/big = unrecovered drops. */
@@ -1189,12 +1220,13 @@ void RTW88Ethernet::rxLoop()
                 uint64_t n = gRateN;
                 IOLog("RTW-health: rx=%llu err=%llu retry=%llu rate[avg=%llu max=%llu min=%llu] "
                       "ringFull=%llu maxDepth=%llu txDrop=%llu | reorder[active=0x%x rel=%llu buf=%llu timeout=%llu stale=%llu dup=%llu] "
-                      "| parse=%llu{htcfix=%llu llc=%llu amsdu=%llu short=%llu big=%llu}\n",
+                      "| parse=%llu{htcfix=%llu llc=%llu amsdu=%llu short=%llu big=%llu} | dig[igi=0x%x fa=%llu]\n",
                       gDrx, gDrxErr, gDrxRetry,
                       n ? gRateSum / n : 0, gRateMax, n ? gRateMin : 0,
                       gRxRingFull, gDrxMaxDepth, gDtxDrop,
                       gReordActiveMask, gReordRel, gReordBuf, gReordTo, gReordStale, gReordDup,
-                      gDrxParse, gPHtcFix, gPLlc, gPAmsdu, gPShort, gPBig);
+                      gDrxParse, gPHtcFix, gPLlc, gPAmsdu, gPShort, gPBig,
+                      gDigIgi, gDigFa);
             }
         }
         /* low-latency idle: keep spinning briefly after activity (download inter-burst

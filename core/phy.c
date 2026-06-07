@@ -65,9 +65,22 @@ bool rtw_write_rf(struct rtw_dev *rtwdev, enum rtw_rf_path rf_path, u32 addr, u3
  * the connection channel after it's tuned. */
 extern int trx_tx_h2c(struct rtw_dev *rtwdev, const u8 *pkt);
 
+/* tell the MCU RF-calibration is starting/stopping (rtw_fw_inform_rfk_status) via the
+ * 8-byte mailbox: H2C_CMD_WIFI_CALIBRATION=0x6d, RFK_SET_INFORM_START=BIT(8). The firmware
+ * needs this to actually run IQK — without it the IQK packet was ignored (the TIMEOUT). */
+static void iqk_inform_rfk(struct rtw_dev *rtwdev, int start)
+{
+    for (int i = 0; i < 100; i++) { if (!(hw_read8(REG_HMETFR) & BIT(0))) break; usleep_range(1000, 1000); }
+    hw_write32(REG_HMEBOX0_EX, 0);
+    hw_write32(REG_HMEBOX0, start ? 0x0000016d : 0x0000006d);   /* 0x6d | (start?BIT(8):0) */
+    usleep_range(2000, 2000);
+}
+
 void rtw_do_iqk(struct rtw_dev *rtwdev)
 {
     static u16 seq = 2;                 /* fw_handshake used seq 0,1 at bring-up */
+    iqk_inform_rfk(rtwdev, 1);          /* RFK start — required or the fw ignores IQK */
+
     u8 pkt[32] = {0};
     u32 *w = (u32 *)pkt;
     w[0] = 0x01u | (0xFFu << 8) | (0x0Eu << 16);   /* category 0x01 | cmd 0xFF | sub_id IQK(0x0E) */
@@ -76,12 +89,13 @@ void rtw_do_iqk(struct rtw_dev *rtwdev)
     trx_tx_h2c(rtwdev, pkt);
 
     int done = 0;
-    for (int i = 0; i < 150; i++) {                /* cap ~3s; proceed regardless */
+    for (int i = 0; i < 100; i++) {                /* cap ~2s; proceed regardless */
         u32 rf = rtw_phy_read_rf(rtwdev, RF_PATH_A, 0x08, RFREG_MASK);
         if (rf == 0xabcde) { done = 1; break; }
         usleep_range(20000, 20000);
     }
     rtw_write_rf(rtwdev, RF_PATH_A, 0x08, RFREG_MASK, 0x0);
+    iqk_inform_rfk(rtwdev, 0);          /* RFK stop */
     rtw_info(rtwdev, "  IQK %s", done ? "done (fw 0xABCDE)" : "TIMEOUT (uncalibrated)");
 }
 
