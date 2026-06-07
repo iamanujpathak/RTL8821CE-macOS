@@ -240,13 +240,17 @@ void set_channel(struct rtw_dev *rtwdev, u8 channel, u8 bw, u8 primary_ch_idx)
     set_channel_rf(rtwdev, channel, bw);
     set_channel_rxdfir(rtwdev, bw);
 
-    /* TEST: fixed moderate per-rate TX AGC so probe requests actually radiate.
-     * 8821c writes power to offset_txagc[path A]=0x1d00 + (rate & 0xfc), 4 rates
-     * per u32 (rtw8821c_set_tx_power_index_by_rate). 0x28 ~= mid power index.
-     * Proper efuse-driven power index is a later step. */
-    rtw_write32(rtwdev, 0x1d00, 0x28282828);  /* CCK  1/2/5.5/11   */
-    rtw_write32(rtwdev, 0x1d04, 0x28282828);  /* OFDM 6/9/12/18    */
-    rtw_write32(rtwdev, 0x1d08, 0x28282828);  /* OFDM 24/36/48/54  */
+    /* Fixed per-rate TX AGC (proper efuse-driven power index is a later step). 8821c
+     * writes power to offset_txagc[path A]=0x1d00 + (rate & 0xfc), 4 rates per u32
+     * (rtw8821c_set_tx_power_index_by_rate). Raised 0x28->0x38 and ADDED the HT-MCS
+     * registers (0x1d0c/0x1d10) — previously HT TX power was left uncalibrated, so our
+     * data uplink + Block-Ack responses may have been under-powered (AP mis-hears our
+     * acks -> retransmits + drops ~50% downlink). 0x38 of max 0x3f. */
+    rtw_write32(rtwdev, 0x1d00, 0x38383838);  /* CCK  1/2/5.5/11   */
+    rtw_write32(rtwdev, 0x1d04, 0x38383838);  /* OFDM 6/9/12/18    */
+    rtw_write32(rtwdev, 0x1d08, 0x38383838);  /* OFDM 24/36/48/54  */
+    rtw_write32(rtwdev, 0x1d0c, 0x38383838);  /* HT   MCS0-3       */
+    rtw_write32(rtwdev, 0x1d10, 0x38383838);  /* HT   MCS4-7       */
 }
 
 /* ---- RX enable + poll ---------------------------------------------------- */
