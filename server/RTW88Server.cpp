@@ -1200,9 +1200,17 @@ void RTW88Ethernet::rxLoop()
                 uint32_t fas = mmioR32(0x09a4);                    /* REG_FAS: reset FA counters */
                 mmioW32(0x09a4, fas |  (1u << 17));
                 mmioW32(0x09a4, fas & ~(1u << 17));
-                if      (fa > 750 && igi < 0x3e) igi += 2;
-                else if (fa > 250 && igi < 0x3e) igi += 1;
-                else if (fa < 250 && igi > 0x1c) igi -= 1;
+                /* DIG only sees false-alarms, so at a strong close-range signal it would
+                 * floor the gain to max sensitivity (0x1c) — but an over-sensitive receiver
+                 * on a strong signal SATURATES/clips and drops frames WITHOUT raising FA
+                 * (the ~40% loss with fa~0). Windows backs gain OFF on strong signal. So at
+                 * low FA, settle toward a less-sensitive 0x32 rather than the floor; raise
+                 * further only if FA actually appears. */
+                const uint32_t DIG_TARGET = 0x32;
+                if      (fa > 750 && igi < 0x3e)        igi += 2;
+                else if (fa > 250 && igi < 0x3e)        igi += 1;
+                else if (igi > DIG_TARGET)              igi -= 1;   /* low FA -> drift down to target */
+                else if (igi < DIG_TARGET)              igi += 1;   /* ...and up to target */
                 mmioW32(0xc50, (mmioR32(0xc50) & ~0x7fu) | (igi & 0x7f));
                 gDigFa = fa; gDigIgi = igi;
             }
