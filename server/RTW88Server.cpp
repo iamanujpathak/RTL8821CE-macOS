@@ -66,6 +66,34 @@ static RTW88Server *g_dev = nullptr;
  * inputPacket()s — no per-packet syscalls. The interface MAC is the card's real
  * MAC so the AP addressing stays consistent.
  */
+/*
+ * Per-TID A-MPDU RX reorder buffer (mac80211 tid_ampdu_rx port). Now that the ASPM
+ * fix lets VHT A-MPDU actually flow, retransmitted sub-frames arrive out of order;
+ * delivering them straight to TCP collapses the window. One window per TID, created
+ * from the AP's ADDBA (SSN + buffer size), released in order with a 100ms hole
+ * timeout. Single-threaded on rxLoop, no locks. Slot index uses %64 (divides the
+ * 4096 SN space) so it never collides at the 12-bit wrap.
+ */
+#define RTW_BA_TID_NUM         8
+#define RTW_BA_WIN_MAX         64
+#define RTW_REORDER_SLOT_SZ    12288               /* >= VHT MAX_MPDU (11454) + headers */
+#define RTW_REORDER_TIMEOUT_NS (100ull * 1000 * 1000)
+#define RTW_REORDER_IDX(sn)    ((uint32_t)((sn) & (RTW_BA_WIN_MAX - 1)))
+
+struct ReorderTid {
+    bool      active, started;
+    uint16_t  head, win;
+    uint32_t  stored;
+    uint8_t  *store;
+    uint32_t  len[RTW_BA_WIN_MAX];
+    uint64_t  t_ns[RTW_BA_WIN_MAX];
+    bool      occ[RTW_BA_WIN_MAX];
+};
+static inline bool     rtw_sn_less(uint16_t a, uint16_t b) { return ((uint16_t)(a - b) & 0xfff) > 0x800; }
+static inline uint16_t rtw_sn_inc(uint16_t a)              { return (uint16_t)((a + 1) & 0xfff); }
+static inline uint16_t rtw_sn_sub(uint16_t a, uint16_t b)  { return (uint16_t)((a - b) & 0xfff); }
+static inline uint64_t rtw_uptime_ns(void) { uint64_t a, ns; clock_get_uptime(&a); absolutetime_to_nanoseconds(a, &ns); return ns; }
+
 class RTW88Ethernet : public IOEthernetController {
     OSDeclareDefaultStructors(RTW88Ethernet)
 public:
@@ -115,13 +143,27 @@ private:
     volatile bool        fRxStop   = false;
     volatile bool        fRxDone   = false;
 
+    /* per-TID A-MPDU RX reorder state (single-threaded on rxLoop) */
+    ReorderTid           fBa[RTW_BA_TID_NUM];
+    bool                 fPendingFlush = false;
+
     static void rxThreadTrampoline(void *arg, wait_result_t);
     void rxLoop();
-    void rxFrame(const uint8_t *f, uint32_t pkt_len);
+    void rxFrame(const uint8_t *f, uint32_t pkt_len);       /* dispatch -> reorder or deliver */
+    void deliverMpdu(const uint8_t *f, uint32_t pkt_len);   /* parse one data MPDU -> eth -> stack */
     void txEthFrame(const uint8_t *eth, uint32_t ethlen);
     void txAction(const uint8_t *frame, uint32_t flen);   /* unencrypted fixed-rate mgmt TX */
     void handleAddbaReq(const uint8_t *f, uint32_t len);   /* answer the AP's Block-Ack setup */
+    void handleDelba(const uint8_t *f, uint32_t len);      /* AP tears a Block-Ack session down */
     void inputEth(const uint8_t *data, uint32_t len);
+    /* reorder engine */
+    void     reorderActivate(uint8_t tid, uint16_t ssn, uint16_t win);
+    void     reorderDeactivate(uint8_t tid);
+    void     reorderFreeAll();
+    void     reorderInsert(uint8_t tid, uint16_t sn, const uint8_t *f, uint32_t len);
+    void     deliverSlot(ReorderTid *rt, uint32_t idx);
+    uint32_t reorderDrainReady(ReorderTid *rt);
+    uint32_t reorderTimeoutAll();
     inline uint32_t mmioR32(uint32_t off) { return *(volatile uint32_t *)(fMmio + off); }
     inline void     mmioW16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(fMmio + off) = v; }
 };
@@ -151,6 +193,11 @@ static volatile uint16_t gLastSeq = 0xffff;
  * gTidMask: bitmask of TIDs seen (popcount rules the multi-TID question in/out). */
 static volatile uint64_t gMiss, gRxRingFull, gRateSum, gRateN, gRateMax, gRetryDup;
 static volatile uint64_t gRateMin = 0xff;   /* lowest RX PHY-rate code — detects MCS0/CCK flooring */
+/* parse-drop breakdown (which path drops the ~14% gDrxParse): */
+static volatile uint64_t gPShort, gPLlc, gPAmsdu, gPBig, gPHtcFix;   /* gPHtcFix = recovered via +/-HTC retry */
+/* reorder activity for the health log: */
+static volatile uint64_t gReordBuf, gReordTo;
+static volatile uint32_t gReordActiveMask;
 static volatile uint64_t gBigJump;   /* per-TID seq jumps > a BA window: AP serving others / idle gap, NOT our loss */
 static volatile uint32_t gTidMask;
 static uint16_t gLastSeqTid[8] = {0xffff,0xffff,0xffff,0xffff,0xffff,0xffff,0xffff,0xffff};
@@ -548,9 +595,9 @@ IOReturn RTW88Server::power(bool memEnable, bool busMaster)
 void RTW88Server::disableAspm()
 {
     if (!fPci) return;
-    UInt8 cap = fPci->findPCICapability(0x10 /* PCI Express Capability ID */);
+    uint32_t cap = fPci->findPCICapability(0x10 /* PCI Express Capability ID */) & 0xff;
     if (!cap) { IOLog("RTW-bridge: no PCIe cap — cannot disable ASPM\n"); return; }
-    uint32_t lctl_off = (uint32_t)cap + 0x10;             /* Link Control register */
+    uint32_t lctl_off = cap + 0x10;             /* Link Control register */
     uint16_t lctl = fPci->configRead16(lctl_off);
     uint16_t neu  = lctl & ~0x0003;                        /* clear ASPM L0s|L1 enable */
     if (neu != lctl) fPci->configWrite16(lctl_off, neu);
@@ -789,6 +836,147 @@ void RTW88Ethernet::handleAddbaReq(const uint8_t *f, uint32_t len)
 
     gAddba++;
     IOLog("RTW88: ADDBA req (tid %u) -> ADDBA resp accepted; HW Block-Ack on\n", tid);
+
+    /* spin up this TID's reorder window from the negotiated SSN + buffer size. */
+    uint16_t ba_ssc = (uint16_t)(rq[7] | (rq[8] << 8));
+    reorderActivate(tid, (uint16_t)(ba_ssc >> 4), (uint16_t)((ba_param >> 6) & 0x3ff));
+}
+
+/* DELBA: flush the TID's buffered frames in order and free the window. */
+void RTW88Ethernet::handleDelba(const uint8_t *f, uint32_t len)
+{
+    if (len < 24 + 6) return;
+    uint16_t params = (uint16_t)(f[26] | (f[27] << 8));     /* DELBA params: TID = bits[15:12] */
+    uint8_t  tid    = (uint8_t)((params >> 12) & 0xf);
+    if (tid < RTW_BA_TID_NUM) reorderDeactivate(tid);
+}
+
+#pragma mark - per-TID A-MPDU RX reorder buffer (mac80211 tid_ampdu_rx port)
+
+void RTW88Ethernet::reorderActivate(uint8_t tid, uint16_t ssn, uint16_t win)
+{
+    if (tid >= RTW_BA_TID_NUM) return;
+    ReorderTid *rt = &fBa[tid];
+    if (rt->store) { IOFree(rt->store, (size_t)RTW_BA_WIN_MAX * RTW_REORDER_SLOT_SZ); rt->store = nullptr; }
+    if (win < 1) win = 1; if (win > RTW_BA_WIN_MAX) win = RTW_BA_WIN_MAX;
+    rt->store = (uint8_t *)IOMalloc((size_t)RTW_BA_WIN_MAX * RTW_REORDER_SLOT_SZ);
+    if (!rt->store) { rt->active = false; return; }
+    for (uint32_t i = 0; i < RTW_BA_WIN_MAX; i++) rt->occ[i] = false;
+    rt->head = (uint16_t)(ssn & 0xfff);
+    rt->win = win; rt->stored = 0; rt->started = false; rt->active = true;
+    gReordActiveMask |= (1u << tid);
+    IOLog("RTW88: reorder TID %u ON (ssn %u win %u)\n", tid, rt->head, win);
+}
+
+void RTW88Ethernet::deliverSlot(ReorderTid *rt, uint32_t idx)
+{
+    if (!rt->occ[idx]) return;
+    deliverMpdu(rt->store + (uint64_t)idx * RTW_REORDER_SLOT_SZ, rt->len[idx]);
+    rt->occ[idx] = false;
+    if (rt->stored) rt->stored--;
+}
+
+uint32_t RTW88Ethernet::reorderDrainReady(ReorderTid *rt)
+{
+    uint32_t released = 0;
+    for (;;) {
+        uint32_t idx = RTW_REORDER_IDX(rt->head);
+        if (!rt->occ[idx]) break;
+        deliverSlot(rt, idx);
+        rt->head = rtw_sn_inc(rt->head);
+        released++;
+    }
+    return released;
+}
+
+void RTW88Ethernet::reorderInsert(uint8_t tid, uint16_t sn, const uint8_t *f, uint32_t len)
+{
+    ReorderTid *rt = &fBa[tid];
+    uint16_t win = rt->win;
+    if (!rt->started) {
+        if (rtw_sn_less(sn, rt->head)) { deliverMpdu(f, len); return; }
+        rt->started = true;
+    }
+    if (rtw_sn_less(sn, rt->head)) return;                              /* (A) stale -> drop */
+    if (!rtw_sn_less(sn, (uint16_t)((rt->head + win) & 0xfff))) {       /* (B) beyond window -> slide */
+        uint16_t newhead = rtw_sn_inc(rtw_sn_sub(sn, win));
+        while (rtw_sn_less(rt->head, newhead)) {
+            uint32_t idx = RTW_REORDER_IDX(rt->head);
+            if (rt->occ[idx]) deliverSlot(rt, idx);
+            rt->head = rtw_sn_inc(rt->head);
+        }
+    }
+    uint32_t index = RTW_REORDER_IDX(sn);
+    if (rt->occ[index]) return;                                        /* (C) duplicate */
+    if (sn == rt->head && rt->stored == 0) {                           /* (D) fast path */
+        rt->head = rtw_sn_inc(rt->head);
+        deliverMpdu(f, len);
+        return;
+    }
+    if (len > RTW_REORDER_SLOT_SZ) { deliverMpdu(f, len); return; }     /* (E) buffer */
+    memcpy(rt->store + (uint64_t)index * RTW_REORDER_SLOT_SZ, f, len);
+    rt->len[index] = len;
+    rt->t_ns[index] = rtw_uptime_ns();
+    rt->occ[index] = true;
+    rt->stored++;
+    gReordBuf++;
+    reorderDrainReady(rt);
+}
+
+/* periodic sweep: when the head slot is a hole older than 100ms, skip it and release
+ * what's waiting behind. Called every rxLoop pass (incl. idle). */
+uint32_t RTW88Ethernet::reorderTimeoutAll()
+{
+    uint32_t released = 0; uint64_t now = 0;
+    for (uint8_t tid = 0; tid < RTW_BA_TID_NUM; tid++) {
+        ReorderTid *rt = &fBa[tid];
+        if (!rt->active || rt->stored == 0) continue;
+        if (!now) now = rtw_uptime_ns();
+        for (;;) {
+            uint32_t idx = RTW_REORDER_IDX(rt->head);
+            if (rt->occ[idx]) { released += reorderDrainReady(rt); break; }
+            if (rt->stored == 0) break;
+            uint32_t jdist = 0, jidx = 0; bool found = false;
+            for (uint32_t k = 1; k < rt->win; k++) {
+                uint32_t i = RTW_REORDER_IDX(rt->head + k);
+                if (rt->occ[i]) { found = true; jdist = k; jidx = i; break; }
+            }
+            if (!found) break;
+            if (now <= rt->t_ns[jidx] + RTW_REORDER_TIMEOUT_NS) break;
+            gReordTo += jdist;
+            rt->head = (uint16_t)((rt->head + jdist) & 0xfff);
+            released += reorderDrainReady(rt);
+        }
+    }
+    return released;
+}
+
+void RTW88Ethernet::reorderDeactivate(uint8_t tid)
+{
+    if (tid >= RTW_BA_TID_NUM) return;
+    ReorderTid *rt = &fBa[tid];
+    if (!rt->active) return;
+    if (rt->store) {
+        for (uint32_t k = 0; k < rt->win; k++) {
+            uint32_t idx = RTW_REORDER_IDX(rt->head + k);
+            if (rt->occ[idx]) deliverSlot(rt, idx);
+        }
+        IOFree(rt->store, (size_t)RTW_BA_WIN_MAX * RTW_REORDER_SLOT_SZ);
+        rt->store = nullptr;
+    }
+    rt->active = false; rt->started = false; rt->stored = 0;
+    gReordActiveMask &= ~(1u << tid);
+    IOLog("RTW88: reorder TID %u OFF\n", tid);
+}
+
+void RTW88Ethernet::reorderFreeAll()
+{
+    for (uint8_t tid = 0; tid < RTW_BA_TID_NUM; tid++) {
+        ReorderTid *rt = &fBa[tid];
+        if (rt->store) { IOFree(rt->store, (size_t)RTW_BA_WIN_MAX * RTW_REORDER_SLOT_SZ); rt->store = nullptr; }
+        rt->active = false; rt->started = false; rt->stored = 0;
+    }
+    gReordActiveMask = 0;
 }
 
 /* the IOEthernetController output path: in data mode do the full TX in-kernel */
@@ -801,17 +989,21 @@ void RTW88Ethernet::inputEth(const uint8_t *data, uint32_t len)
     if (!m) return;
     if (mbuf_copyback(m, 0, len, data, MBUF_DONTWAIT) != 0) { freePacket(m); return; }
     fNetif->inputPacket(m, len, IONetworkInterface::kInputOptionQueuePacket);   /* rxLoop flushes once per drain */
+    fPendingFlush = true;
 }
 
-/* one received 802.11 data frame -> Ethernet -> stack */
+/* dispatch one received 802.11 frame: BlockAck action frames (ADDBA/DELBA), then DATA
+ * frames -> per-TID reorder -> deliverMpdu. Runs on the rxLoop thread. */
 void RTW88Ethernet::rxFrame(const uint8_t *f, uint32_t pkt_len)
 {
     uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
-    /* management Action frame? (type=00, subtype=1101 -> f[0]==0xd0). Answer the AP's
-     * ADDBA Request (BlockAck category 3, action 0) to enable downlink aggregation. */
+    /* management Action frame? (type=00, subtype=1101 -> f[0]==0xd0). BlockAck category
+     * (3): action 0 = ADDBA Request (enable downlink aggregation), action 2 = DELBA. */
     if ((f[0] & 0x0c) == 0x00) {                            /* type = management */
-        if ((f[0] & 0xf0) == 0xd0 && pkt_len >= 26 && f[24] == 0x03 && f[25] == 0x00)
-            handleAddbaReq(f, pkt_len);
+        if ((f[0] & 0xf0) == 0xd0 && pkt_len >= 26 && f[24] == 0x03) {
+            if (f[25] == 0x00)      handleAddbaReq(f, pkt_len);
+            else if (f[25] == 0x02) handleDelba(f, pkt_len);
+        }
         return;
     }
     if (((fc >> 2) & 3) != 2) return;                       /* else DATA frames only */
@@ -849,53 +1041,94 @@ void RTW88Ethernet::rxFrame(const uint8_t *f, uint32_t pkt_len)
         }
         gLastSeqTid[tid] = seq;
     }
-    /* header = 24 + QoS-control(2) + HT-Control(4, present when Order/+HTC, fc bit15)
-     * + CCMP-header(8, present when Protected, fc bit14). VHT APs set +HTC on data
-     * frames for link-adaptation feedback; missing those 4 bytes shifts the payload
-     * and the frame fails to parse (the residual `pdrop`). The HW decrypts in place
-     * but leaves the CCMP header, so the MSDU starts after it. */
-    uint32_t hdr = 24 + (qos ? 2 : 0) + (((fc >> 15) & 1) ? 4 : 0) + (((fc >> 14) & 1) ? 8 : 0);
-    if (pkt_len < hdr + 8) { gDrxParse++; return; }
+    /* per-TID A-MPDU reorder: QoS unicast in an active BA session -> reorder; everything
+     * else (mgmt/multicast/non-QoS/no-session) delivers immediately, in order. */
+    if (qos && !(f[4] & 0x01)) {
+        uint8_t rtid   = (uint8_t)(f[24] & 0x07);
+        uint8_t ackpol = (uint8_t)((f[24] >> 5) & 0x03);
+        if (fBa[rtid].active && ackpol != 0x01) {
+            uint16_t sn = (uint16_t)(((f[22] | (f[23] << 8)) >> 4) & 0xfff);
+            reorderInsert(rtid, sn, f, pkt_len);
+            return;
+        }
+    }
+    deliverMpdu(f, pkt_len);
+}
 
-    /* A-MSDU (QoS control octet0 bit7): one MPDU carries several Ethernet subframes
-     * back-to-back — {DA(6),SA(6),len(2),MSDU(len)} each padded to 4 bytes. These are
-     * the efficient aggregated frames; not splitting them was dropping ~10% of RX
-     * (the `pdrop` counter) and starving TCP. Deliver each subframe up the stack. */
-    if (qos && (f[24] & 0x80)) {
-        const uint8_t *p = f + hdr;
-        uint32_t rem = pkt_len - hdr;
-        int delivered = 0;
+/* Is `cand` a plausible 802.11 header length? For A-MSDU the first subframe's LLC sits
+ * at cand+14; otherwise the MSDU LLC sits at cand. Used to resolve the +HTC ambiguity. */
+static inline bool rtw_hdr_ok(const uint8_t *f, uint32_t pkt_len, bool amsdu, uint32_t cand)
+{
+    if (cand + 8 > pkt_len) return false;
+    if (amsdu) {
+        const uint8_t *p = f + cand; uint32_t rem = pkt_len - cand;
+        if (rem < 14 + 8) return false;
+        uint32_t sublen = (uint32_t)((p[12] << 8) | p[13]);
+        if (sublen < 8 || 14 + sublen > rem) return false;
+        const uint8_t *s = p + 14;
+        return s[0] == 0xaa && s[1] == 0xaa && s[2] == 0x03;
+    }
+    const uint8_t *l = f + cand;
+    return l[0] == 0xaa && l[1] == 0xaa && l[2] == 0x03;
+}
+
+/* parse one in-order data MPDU -> Ethernet frame(s) -> stack (A-MSDU split inline).
+ * Robust to the VHT +HTC ambiguity: the chip may or may not carry the 4-byte HT-Control
+ * field even with the FC Order bit set, which shifts the LLC — the dominant ~14% parse
+ * drop. Try the FC-implied offset, else the other HTC choice; pick whichever has a valid
+ * LLC. The HW decrypts in place but leaves the 8-byte CCMP header, so the MSDU is after it. */
+void RTW88Ethernet::deliverMpdu(const uint8_t *f, uint32_t pkt_len)
+{
+    uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
+    bool qos   = ((fc >> 4) & 0x8);
+    bool amsdu = qos && (f[24] & 0x80);
+    uint32_t base  = 24 + (qos ? 2 : 0) + (((fc >> 14) & 1) ? 8 : 0);   /* + CCMP, no HTC yet */
+    uint32_t fchtc = ((fc >> 15) & 1) ? 4 : 0;                          /* FC Order => +HTC   */
+    uint32_t cands[2] = { base + fchtc, base + (fchtc ? 0 : 4) };       /* FC-implied, then the other */
+
+    uint32_t hdr = 0; bool found = false;
+    for (int i = 0; i < 2; i++)
+        if (rtw_hdr_ok(f, pkt_len, amsdu, cands[i])) { hdr = cands[i]; found = true; if (i) gPHtcFix++; break; }
+    if (!found) {
+        if (base + 8 > pkt_len)      gPShort++;
+        else if (amsdu)              gPAmsdu++;
+        else                         gPLlc++;
+        gDrxParse++;
+        return;
+    }
+
+    if (amsdu) {                                            /* {DA(6),SA(6),len(2),MSDU} subframes */
+        const uint8_t *p = f + hdr; uint32_t rem = pkt_len - hdr; int delivered = 0;
         while (rem >= 14) {
-            uint32_t sublen = (uint32_t)((p[12] << 8) | p[13]);  /* MSDU length */
+            uint32_t sublen = (uint32_t)((p[12] << 8) | p[13]);
             if (sublen < 8 || 14 + sublen > rem) break;
-            const uint8_t *sllc = p + 14;                        /* MSDU = LLC/SNAP + payload */
+            const uint8_t *sllc = p + 14;
             if (sllc[0] == 0xaa && sllc[1] == 0xaa && sllc[2] == 0x03) {
                 uint32_t plen = sublen - 8;
                 if (plen <= 1600) {
                     uint8_t eth[1614];
-                    memcpy(eth, p, 12);                          /* subframe DA + SA */
-                    eth[12] = sllc[6]; eth[13] = sllc[7];        /* ethertype */
+                    memcpy(eth, p, 12);
+                    eth[12] = sllc[6]; eth[13] = sllc[7];
                     memcpy(eth + 14, sllc + 8, plen);
                     inputEth(eth, 14 + plen);
                     delivered++;
                 }
             }
-            uint32_t adv = (14 + sublen + 3) & ~3u;              /* next subframe (4-byte aligned) */
+            uint32_t adv = (14 + sublen + 3) & ~3u;
             if (adv > rem) break;
             p += adv; rem -= adv;
         }
-        if (!delivered) gDrxParse++;
+        if (!delivered) { gPAmsdu++; gDrxParse++; }
         return;
     }
 
     const uint8_t *llc = f + hdr;
-    if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 0x03) { gDrxParse++; return; }
     uint16_t et = (uint16_t)((llc[6] << 8) | llc[7]);
     uint32_t plen = pkt_len - hdr - 8;
-    if (plen > 1600) { gDrxParse++; return; }
+    if (plen > 1600) { gPBig++; gDrxParse++; return; }
     uint8_t eth[1614];
-    memcpy(eth, f + 4, 6);        /* addr1 = DA (us / bcast / mcast) */
-    memcpy(eth + 6, f + 16, 6);   /* addr3 = SA                       */
+    memcpy(eth, f + 4, 6);        /* addr1 = DA (us)  */
+    memcpy(eth + 6, f + 16, 6);   /* addr3 = SA       */
     eth[12] = (uint8_t)(et >> 8); eth[13] = (uint8_t)et;
     memcpy(eth + 14, llc + 8, plen);
     inputEth(eth, 14 + plen);
@@ -912,7 +1145,7 @@ void RTW88Ethernet::rxLoop()
         uint32_t depth = (hw - fRxRp + fRxN) % fRxN;    /* current ring occupancy */
         if (depth > gDrxMaxDepth) gDrxMaxDepth = depth;
         if (depth >= fRxN - 2) gRxRingFull++;   /* HW has lapped us -> frames overwritten */
-        bool got = false, delivered = false;
+        bool got = false;
         while (fRxRp != hw && !fRxStop) {
             uint8_t *buf = fRxData + (uint64_t)fRxRp * fRxBufSz;
             uint32_t w0 = *(volatile uint32_t *)buf;
@@ -927,18 +1160,20 @@ void RTW88Ethernet::rxLoop()
                 if (rate < gRateMin) gRateMin = rate;  /* min: low => AP flooring us to MCS0/CCK */
                 gDrxBytes += pkt_len;
                 uint32_t off = fRxDescSz + shift + drv * 8;
-                if (off + pkt_len <= fRxBufSz) { rxFrame(buf + off, pkt_len); delivered = true; }
+                if (off + pkt_len <= fRxBufSz) rxFrame(buf + off, pkt_len);
             }
             fRxRp = (fRxRp + 1) % fRxN;
             got = true;
         }
         if (got) mmioW16(RTK_PCI_RXBD_IDX_MPDUQ_K, (uint16_t)(fRxRp & 0xfff));   /* release */
-        if (delivered && fNetif) fNetif->flushInputQueue();   /* one stack flush per drain (batched) */
+        /* release any reorder-buffered frames whose missing predecessor has timed out (100ms),
+         * every pass incl. idle, so a never-retransmitted hole can't stall the flow. */
+        reorderTimeoutAll();
+        if (fPendingFlush && fNetif) { fNetif->flushInputQueue(); fPendingFlush = false; }
 
-        /* passive RX health snapshot every ~10s -> system log (no behavior change; reads
-         * existing counters). Lets `log stream` confirm the ASPM/SIG-B fix without --kstats.
-         * rate codes: <12 legacy/CCK (floored), 12-27 HT MCS, >=44 VHT. High ringFull/err
-         * => RX loss; low rate => PHY/rate floor. */
+        /* passive RX health snapshot every ~10s -> system log (reads counters; no behavior
+         * change). rate codes: <12 legacy/CCK, 12-27 HT, >=44 VHT. parse breakdown: htcfix =
+         * frames recovered via the +/-HTC retry; llc/amsdu/short/big = unrecovered drops. */
         {
             static uint64_t lastHealthNs = 0;
             uint64_t a = 0, nowNs = 0;
@@ -947,10 +1182,13 @@ void RTW88Ethernet::rxLoop()
                 lastHealthNs = nowNs;
                 uint64_t n = gRateN;
                 IOLog("RTW-health: rx=%llu err=%llu retry=%llu rate[avg=%llu max=%llu min=%llu] "
-                      "ringFull=%llu maxDepth=%llu parse=%llu txDrop=%llu\n",
+                      "ringFull=%llu maxDepth=%llu txDrop=%llu | reorder[active=0x%x buf=%llu timeout=%llu] "
+                      "| parse=%llu{htcfix=%llu llc=%llu amsdu=%llu short=%llu big=%llu}\n",
                       gDrx, gDrxErr, gDrxRetry,
                       n ? gRateSum / n : 0, gRateMax, n ? gRateMin : 0,
-                      gRxRingFull, gDrxMaxDepth, gDrxParse, gDtxDrop);
+                      gRxRingFull, gDrxMaxDepth, gDtxDrop,
+                      gReordActiveMask, gReordBuf, gReordTo,
+                      gDrxParse, gPHtcFix, gPLlc, gPAmsdu, gPShort, gPBig);
             }
         }
         /* low-latency idle: keep spinning briefly after activity (download inter-burst
@@ -1007,6 +1245,12 @@ bool RTW88Ethernet::startData(RTW88Server *server, const struct rtw_data_cfg *cf
     fCcmpPn = 1;
     fDataMode = true;
 
+    /* reorder windows start empty; created lazily on each TID's ADDBA. */
+    for (int i = 0; i < RTW_BA_TID_NUM; i++) {
+        fBa[i].active = false; fBa[i].started = false; fBa[i].stored = 0; fBa[i].store = nullptr;
+    }
+    fPendingFlush = false;
+
     fRxStop = false; fRxDone = false;
     if (kernel_thread_start(&RTW88Ethernet::rxThreadTrampoline, this, &fRxThread) != KERN_SUCCESS) {
         fDataMode = false;
@@ -1023,6 +1267,7 @@ void RTW88Ethernet::stopData()
     fRxStop = true;
     for (int i = 0; i < 400 && !fRxDone; i++) IOSleep(5);   /* wait up to ~2s */
     if (fRxThread != THREAD_NULL) { thread_deallocate(fRxThread); fRxThread = THREAD_NULL; }
+    reorderFreeAll();   /* RX thread gone -> safe to free the reorder windows */
     fDataMode = false;
     if (fTxPool) { fTxPool->complete(); fTxPool->release(); fTxPool = nullptr; }
     IOLog("RTW-data: data path stopped\n");
