@@ -150,6 +150,7 @@ static volatile uint16_t gLastSeq = 0xffff;
  * gRetryDup: retry-bit frames whose per-TID seq is a dup/old one (AP resend we DID get).
  * gTidMask: bitmask of TIDs seen (popcount rules the multi-TID question in/out). */
 static volatile uint64_t gMiss, gRxRingFull, gRateSum, gRateN, gRateMax, gRetryDup;
+static volatile uint64_t gRateMin = 0xff;   /* lowest RX PHY-rate code — detects MCS0/CCK flooring */
 static volatile uint64_t gBigJump;   /* per-TID seq jumps > a BA window: AP serving others / idle gap, NOT our loss */
 static volatile uint32_t gTidMask;
 static uint16_t gLastSeqTid[8] = {0xffff,0xffff,0xffff,0xffff,0xffff,0xffff,0xffff,0xffff};
@@ -268,6 +269,7 @@ public:
     IOReturn irqStatus(uint32_t off, uint32_t width, uint64_t *out);
     void     setMacPower(bool on);
     IOReturn power(bool memEnable, bool busMaster);
+    void     disableAspm();   /* kill PCIe ASPM L1 — 8821CE stalls RX DMA in L1 while polling */
 
     /* --- in-kext data path (publishes enX, runs TX/RX in-kernel) --- */
     IOReturn dataStart(const struct rtw_data_cfg *cfg);
@@ -328,6 +330,10 @@ bool RTW88Server::start(IOService *provider)
 
     fPci->setMemoryEnable(true);
     fPci->setBusLeadEnable(true);
+    disableAspm();   /* before any DMA: the 8821CE only exits ASPM L1 on an IRQ, and our
+                      * data path polls with the RX IRQ masked, so in L1 the device-initiated
+                      * RX DMA stalls (downlink dies, ~328ms latency) while host-initiated TX
+                      * keeps the link awake (uplink fine). Documented 8821CE quirk. */
 
     fBarMap = fPci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + RTL_BAR_INDEX * 4);
     if (!fBarMap) { IOLog("RTW-bridge: BAR%d map failed\n", RTL_BAR_INDEX); return false; }
@@ -524,6 +530,32 @@ IOReturn RTW88Server::power(bool memEnable, bool busMaster)
     fPci->setBusLeadEnable(busMaster);
     IOLog("RTW-bridge: power mem=%d busmaster=%d\n", memEnable, busMaster);
     return kIOReturnSuccess;
+}
+
+/* Disable PCIe ASPM (L0s + L1) on the device.
+ *
+ * THE downlink fix. Upstream rtw88 documents that "the 8821CE only leaves ASPM L1
+ * for a short period when IRQ is raised; since IRQ is masked during NAPI polling the
+ * PCIe link stays at L1 and makes RX DMA extremely slow — eventually the RX ring
+ * becomes messed up." Our data path is a pure poll loop with the RX IRQ masked, so
+ * the link parks in L1 and the device-initiated RX DMA (downlink) stalls, while
+ * host-initiated TX (our MMIO doorbell writes) keeps the link awake (uplink fine) —
+ * exactly the measured 20x DL/UL asymmetry + 328ms latency.
+ *
+ * Clear the ASPM Control field (bits[1:0]) of the PCI Express Link Control register
+ * so the device never enters L0s/L1. (Upstream toggles per-poll; we never use the RX
+ * IRQ, so we disable it outright for the device's lifetime.) */
+void RTW88Server::disableAspm()
+{
+    if (!fPci) return;
+    UInt8 cap = fPci->findPCICapability(0x10 /* PCI Express Capability ID */);
+    if (!cap) { IOLog("RTW-bridge: no PCIe cap — cannot disable ASPM\n"); return; }
+    uint32_t lctl_off = (uint32_t)cap + 0x10;             /* Link Control register */
+    uint16_t lctl = fPci->configRead16(lctl_off);
+    uint16_t neu  = lctl & ~0x0003;                        /* clear ASPM L0s|L1 enable */
+    if (neu != lctl) fPci->configWrite16(lctl_off, neu);
+    IOLog("RTW-bridge: ASPM disabled (LinkCtl@0x%x 0x%04x -> 0x%04x)\n",
+          lctl_off, lctl, fPci->configRead16(lctl_off));
 }
 
 /* IRQ-status read is REFUSED while the MAC is off — reading ISR on a dead MAC is
@@ -892,6 +924,7 @@ void RTW88Ethernet::rxLoop()
                 if (rate >= 12) gDrxMcs++;             /* >=12 = HT/VHT MCS */
                 gRateSum += rate; gRateN++;            /* avg + peak PHY rate the AP gives us */
                 if (rate > gRateMax) gRateMax = rate;
+                if (rate < gRateMin) gRateMin = rate;  /* min: low => AP flooring us to MCS0/CCK */
                 gDrxBytes += pkt_len;
                 uint32_t off = fRxDescSz + shift + drv * 8;
                 if (off + pkt_len <= fRxBufSz) { rxFrame(buf + off, pkt_len); delivered = true; }
@@ -901,6 +934,25 @@ void RTW88Ethernet::rxLoop()
         }
         if (got) mmioW16(RTK_PCI_RXBD_IDX_MPDUQ_K, (uint16_t)(fRxRp & 0xfff));   /* release */
         if (delivered && fNetif) fNetif->flushInputQueue();   /* one stack flush per drain (batched) */
+
+        /* passive RX health snapshot every ~10s -> system log (no behavior change; reads
+         * existing counters). Lets `log stream` confirm the ASPM/SIG-B fix without --kstats.
+         * rate codes: <12 legacy/CCK (floored), 12-27 HT MCS, >=44 VHT. High ringFull/err
+         * => RX loss; low rate => PHY/rate floor. */
+        {
+            static uint64_t lastHealthNs = 0;
+            uint64_t a = 0, nowNs = 0;
+            clock_get_uptime(&a); absolutetime_to_nanoseconds(a, &nowNs);
+            if (nowNs - lastHealthNs > 10000000000ull) {
+                lastHealthNs = nowNs;
+                uint64_t n = gRateN;
+                IOLog("RTW-health: rx=%llu err=%llu retry=%llu rate[avg=%llu max=%llu min=%llu] "
+                      "ringFull=%llu maxDepth=%llu parse=%llu txDrop=%llu\n",
+                      gDrx, gDrxErr, gDrxRetry,
+                      n ? gRateSum / n : 0, gRateMax, n ? gRateMin : 0,
+                      gRxRingFull, gDrxMaxDepth, gDrxParse, gDtxDrop);
+            }
+        }
         /* low-latency idle: keep spinning briefly after activity (download inter-burst
          * gaps are sub-ms — a 1ms sleep there inflates the RTT and paces TCP down),
          * fall back to a real sleep only once the link is genuinely quiet. */
@@ -979,6 +1031,7 @@ void RTW88Ethernet::stopData()
 IOReturn RTW88Server::dataStart(const struct rtw_data_cfg *cfg)
 {
     if (fEth) return kIOReturnBusy;
+    disableAspm();   /* re-assert: macOS power mgmt may have re-enabled ASPM since start() */
     RTW88Ethernet *eth = new RTW88Ethernet;
     if (!eth) return kIOReturnNoMemory;
     if (!eth->init(NULL)) { eth->release(); return kIOReturnError; }
