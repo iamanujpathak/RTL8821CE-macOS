@@ -197,6 +197,10 @@ static volatile uint64_t gRateMin = 0xff;   /* lowest RX PHY-rate code — detec
 static volatile uint64_t gPShort, gPLlc, gPAmsdu, gPBig, gPHtcFix;   /* gPHtcFix = recovered via +/-HTC retry */
 /* reorder activity for the health log: */
 static volatile uint64_t gReordBuf, gReordTo, gReordRel;   /* gReordRel = frames released in order */
+/* stale = AP resent a frame we already delivered (sn < head); dup = resent into an
+ * occupied slot. HIGH stale/dup => AP retransmitting things we HAVE (Block-Ack/TX issue);
+ * LOW stale/dup + HIGH timeout => frames genuinely never arrive (RX sensitivity). */
+static volatile uint64_t gReordStale, gReordDup;
 static volatile uint32_t gReordActiveMask;
 static volatile uint64_t gBigJump;   /* per-TID seq jumps > a BA window: AP serving others / idle gap, NOT our loss */
 static volatile uint32_t gTidMask;
@@ -898,7 +902,7 @@ void RTW88Ethernet::reorderInsert(uint8_t tid, uint16_t sn, const uint8_t *f, ui
         if (rtw_sn_less(sn, rt->head)) { deliverMpdu(f, len); return; }
         rt->started = true;
     }
-    if (rtw_sn_less(sn, rt->head)) return;                              /* (A) stale -> drop */
+    if (rtw_sn_less(sn, rt->head)) { gReordStale++; return; }           /* (A) stale -> drop */
     if (!rtw_sn_less(sn, (uint16_t)((rt->head + win) & 0xfff))) {       /* (B) beyond window -> slide */
         uint16_t newhead = rtw_sn_inc(rtw_sn_sub(sn, win));
         while (rtw_sn_less(rt->head, newhead)) {
@@ -908,7 +912,7 @@ void RTW88Ethernet::reorderInsert(uint8_t tid, uint16_t sn, const uint8_t *f, ui
         }
     }
     uint32_t index = RTW_REORDER_IDX(sn);
-    if (rt->occ[index]) return;                                        /* (C) duplicate */
+    if (rt->occ[index]) { gReordDup++; return; }                       /* (C) duplicate */
     if (sn == rt->head && rt->stored == 0) {                           /* (D) fast path */
         rt->head = rtw_sn_inc(rt->head);
         gReordRel++;
@@ -1184,12 +1188,12 @@ void RTW88Ethernet::rxLoop()
                 lastHealthNs = nowNs;
                 uint64_t n = gRateN;
                 IOLog("RTW-health: rx=%llu err=%llu retry=%llu rate[avg=%llu max=%llu min=%llu] "
-                      "ringFull=%llu maxDepth=%llu txDrop=%llu | reorder[active=0x%x rel=%llu buf=%llu timeout=%llu] "
+                      "ringFull=%llu maxDepth=%llu txDrop=%llu | reorder[active=0x%x rel=%llu buf=%llu timeout=%llu stale=%llu dup=%llu] "
                       "| parse=%llu{htcfix=%llu llc=%llu amsdu=%llu short=%llu big=%llu}\n",
                       gDrx, gDrxErr, gDrxRetry,
                       n ? gRateSum / n : 0, gRateMax, n ? gRateMin : 0,
                       gRxRingFull, gDrxMaxDepth, gDtxDrop,
-                      gReordActiveMask, gReordRel, gReordBuf, gReordTo,
+                      gReordActiveMask, gReordRel, gReordBuf, gReordTo, gReordStale, gReordDup,
                       gDrxParse, gPHtcFix, gPLlc, gPAmsdu, gPShort, gPBig);
             }
         }

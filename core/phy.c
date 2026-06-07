@@ -56,6 +56,35 @@ bool rtw_write_rf(struct rtw_dev *rtwdev, enum rtw_rf_path rf_path, u32 addr, u3
     return true;
 }
 
+/* ---- IQK (firmware I/Q calibration) — rtw8821c_do_iqk -------------------- *
+ * 8821c calibration is a single firmware H2C (no driver-side DPK/LCK/DACK): send the
+ * IQK packet, then poll RF path-A reg 0x08 (RF_DTXLOK) for the firmware's 0xABCDE
+ * "done" sentinel and clear it. Without it, TX/RX I/Q imbalance leaves an image that
+ * corrupts a large fraction of received symbols -> many silent FCS failures (frames
+ * absent from the ring, err=0) -> the AP rate-floors + the downlink collapses. Run on
+ * the connection channel after it's tuned. */
+extern int trx_tx_h2c(struct rtw_dev *rtwdev, const u8 *pkt);
+
+void rtw_do_iqk(struct rtw_dev *rtwdev)
+{
+    static u16 seq = 2;                 /* fw_handshake used seq 0,1 at bring-up */
+    u8 pkt[32] = {0};
+    u32 *w = (u32 *)pkt;
+    w[0] = 0x01u | (0xFFu << 8) | (0x0Eu << 16);   /* category 0x01 | cmd 0xFF | sub_id IQK(0x0E) */
+    w[1] = 9u | ((u32)seq++ << 16);                /* total_len = HDR(8)+1, seq */
+    w[2] = 0;                                       /* clear=0 (bit0), segment_iqk=0 (bit1): full IQK */
+    trx_tx_h2c(rtwdev, pkt);
+
+    int done = 0;
+    for (int i = 0; i < 150; i++) {                /* cap ~3s; proceed regardless */
+        u32 rf = rtw_phy_read_rf(rtwdev, RF_PATH_A, 0x08, RFREG_MASK);
+        if (rf == 0xabcde) { done = 1; break; }
+        usleep_range(20000, 20000);
+    }
+    rtw_write_rf(rtwdev, RF_PATH_A, 0x08, RFREG_MASK, 0x0);
+    rtw_info(rtwdev, "  IQK %s", done ? "done (fw 0xABCDE)" : "TIMEOUT (uncalibrated)");
+}
+
 /* ---- cfg appliers (phy.c, verbatim) ------------------------------------- */
 void rtw_phy_cfg_mac(struct rtw_dev *rtwdev, const struct rtw_table *tbl, u32 addr, u32 data)
 { (void)tbl; rtw_write8(rtwdev, addr, data); g_cfg_count++; }

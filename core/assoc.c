@@ -20,6 +20,7 @@
 struct wifi_session g_session = { 0, 0, RTW_RATEID_G, DESC_RATE54M };
 
 void set_channel(struct rtw_dev *rtwdev, u8 channel, u8 bw, u8 primary_ch_idx);
+void rtw_do_iqk(struct rtw_dev *rtwdev);   /* phy.c — firmware I/Q calibration */
 int  wpa_handshake(struct rtw_dev *rtwdev, const u8 *bssid,
                          const char *ssid, const char *pass, u8 channel);
 
@@ -211,6 +212,11 @@ int associate(struct rtw_dev *rtwdev, const u8 *bssid,
     printf("\n=== associate to \"%s\" %02x:%02x:%02x:%02x:%02x:%02x ch %u ===\n",
            ssid, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel);
     set_channel(rtwdev, channel, RTW_CHANNEL_WIDTH_20, 0);
+
+    /* IQK on the tuned channel before auth: uncalibrated I/Q imbalance silently drops a
+     * large fraction of RX frames. 5GHz-only for now (the firmware IQK coincided with a
+     * 2.4GHz hard-freeze previously; the user runs 5GHz). Non-fatal on timeout. */
+    if (five) rtw_do_iqk(rtwdev);
 
     /* AUTH (open system) */
     int auth_ok = 0;
