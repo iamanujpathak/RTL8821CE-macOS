@@ -97,7 +97,9 @@ static u32 build_assoc_req(u8 *buf, const u8 *sa, const u8 *bssid,
     buf[n++] = 45; buf[n++] = 26;
     buf[n++] = 0x20; buf[n++] = 0x08;   /* HT cap info: SGI-20 | Max-A-MSDU (the kext  */
                                         /* now de-aggregates A-MSDU, so invite it)     */
-    buf[n++] = 0x0b;                    /* A-MPDU params: 64K factor, density 2    */
+    buf[n++] = 0x1b;                    /* A-MPDU params: 64K factor (3), density 6 (8us). Was
+                                        * density 2 (0.5us) — too tight if our HW drops closely
+                                        * spaced subframes; loosen so the AP spaces them out.  */
     buf[n++] = 0xff;                    /* Supported MCS set: RX MCS0-7 (1SS)      */
     for (int i = 0; i < 15; i++) buf[n++] = 0x00;  /* rest of 16B MCS set          */
     buf[n++] = 0x00; buf[n++] = 0x00;   /* HT extended capabilities                */
