@@ -221,3 +221,25 @@ int hw_kctl_disconnect(void)
 {
     return IOConnectCallScalarMethod(g_conn, kBridgeKDisconnect, NULL, 0, NULL, NULL) == KERN_SUCCESS ? 0 : -1;
 }
+
+/* query the live connection state (kext = source of truth). Fills *st; returns 0
+ * on call success, -1 on failure. */
+int hw_kctl_status(struct rtw_status_result *st)
+{
+    size_t sz = sizeof(*st);
+    memset(st, 0, sz);
+    if (IOConnectCallStructMethod(g_conn, kBridgeKStatus, NULL, 0, st, &sz) != KERN_SUCCESS)
+        return -1;
+    return 0;
+}
+
+/* scan a chunk of channels (BEGIN brings the device up, END tears it down). Fills
+ * *r with that chunk's networks; returns the count or -1 on call failure. */
+int hw_kctl_scan_chunk(const struct rtw_scan_chans *in, struct rtw_scan_result *r)
+{
+    size_t sz = sizeof(*r);
+    memset(r, 0, sz);
+    if (IOConnectCallStructMethod(g_conn, kBridgeKScanChunk, in, sizeof(*in), r, &sz) != KERN_SUCCESS)
+        return -1;
+    return (int)r->count;
+}

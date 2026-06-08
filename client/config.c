@@ -27,6 +27,7 @@
 #include <string.h>
 #include <strings.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
 #include "config.h"
 
 struct wifi_config g_cfg = { .band = BAND_BOTH, .mode = -1 };
@@ -119,6 +120,75 @@ static int load_file(const char *path)
             fprintf(stderr, "config: %s:%d: bad setting '%s = %s'\n", path, lineno, key, val);
     }
     fclose(f);
+    return 0;
+}
+
+/* ---- runtime config persistence (used by rtwd to remember networks) -------- */
+
+/* Public load entry (rtwd has no argv to pass to parse_args). Missing file is
+ * fine — start with an empty known-network list. Returns 0 always. */
+int config_load_file(const char *path)
+{
+    load_file(path);   /* logs + returns -1 if absent; we treat that as "no saved nets" */
+    return 0;
+}
+
+/* Add a network, or update its password if already known. Returns 0 on success. */
+int config_set_network(const char *ssid, const char *pass)
+{
+    if (!ssid || !ssid[0]) return -1;
+    struct wifi_network *n = add_network(ssid);
+    if (!n) return -1;
+    n->password[0] = 0;
+    if (pass) { strncpy(n->password, pass, sizeof n->password - 1); n->password[sizeof n->password - 1] = 0; }
+    return 0;
+}
+
+/* Remove a saved network by SSID. Returns 0 if removed, -1 if not found. */
+int config_forget_network(const char *ssid)
+{
+    for (int i = 0; i < g_cfg.n_nets; i++) {
+        if (strcmp(g_cfg.nets[i].ssid, ssid) == 0) {
+            for (int j = i + 1; j < g_cfg.n_nets; j++) g_cfg.nets[j - 1] = g_cfg.nets[j];
+            g_cfg.n_nets--;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static const char *band_str(int b)
+{ return b == BAND_24 ? "2.4" : b == BAND_5 ? "5" : "both"; }
+
+static void ip_str(unsigned v, char *out, size_t cap)
+{ struct in_addr a; a.s_addr = htonl(v); strncpy(out, inet_ntoa(a), cap - 1); out[cap - 1] = 0; }
+
+/* Rewrite the config file from g_cfg (networks + band/mode/static IP). Loses the
+ * example file's comments, but is idempotent and machine-writable; 0600 since it
+ * holds passphrases. Returns 0 on success, -1 if the file can't be written. */
+int config_save(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "config: cannot write %s\n", path); return -1; }
+    fprintf(f, "# rtw88.conf — written by rtwd. `key = value`; '#' starts a comment.\n");
+    fprintf(f, "# Known networks (each 'network =' starts an entry; 'password =' is its key).\n\n");
+    for (int i = 0; i < g_cfg.n_nets; i++) {
+        fprintf(f, "network  = %s\n", g_cfg.nets[i].ssid);
+        if (g_cfg.nets[i].password[0])
+            fprintf(f, "password = %s\n", g_cfg.nets[i].password);
+        fprintf(f, "\n");
+    }
+    fprintf(f, "band = %s\n", band_str(g_cfg.band));
+    fprintf(f, "mode = %s\n", g_cfg.mode == MODE_SCAN ? "scan" : "eth");
+    if (g_cfg.ip || g_cfg.netmask || g_cfg.gateway || g_cfg.dns) {
+        char b[16];
+        if (g_cfg.ip)      { ip_str(g_cfg.ip, b, sizeof b);      fprintf(f, "ip      = %s\n", b); }
+        if (g_cfg.netmask) { ip_str(g_cfg.netmask, b, sizeof b); fprintf(f, "netmask = %s\n", b); }
+        if (g_cfg.gateway) { ip_str(g_cfg.gateway, b, sizeof b); fprintf(f, "gateway = %s\n", b); }
+        if (g_cfg.dns)     { ip_str(g_cfg.dns, b, sizeof b);     fprintf(f, "dns     = %s\n", b); }
+    }
+    fclose(f);
+    chmod(path, 0600);
     return 0;
 }
 

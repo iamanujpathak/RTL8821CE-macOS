@@ -48,6 +48,8 @@ extern "C" uint32_t rtw_kctl_bringup(void);   /* power -> rings -> fw -> mac_ini
 extern "C" uint32_t rtw_kctl_scan(struct rtw_scan_result *out);   /* bring-up + in-kernel scan */
 extern "C" void rtw_kctl_connect(const struct rtw_connect_req *req, struct rtw_connect_result *out);  /* in-kernel connect */
 extern "C" void rtw_kctl_disconnect(void);   /* tear down enX + rings */
+extern "C" void rtw_kctl_status(struct rtw_status_result *out);   /* live connection state */
+extern "C" void rtw_kctl_scan_chunk(const struct rtw_scan_chans *in, struct rtw_scan_result *out);   /* streamed chunked scan */
 
 /* The active device, for the C control code's DMA/PCI shim (extern "C" wrappers at
  * end of file). Set in RTW88Server::start(). */
@@ -1070,6 +1072,8 @@ public:
     static IOReturn sKScan(OSObject *, void *, IOExternalMethodArguments *);
     static IOReturn sKConnect(OSObject *, void *, IOExternalMethodArguments *);
     static IOReturn sKDisconnect(OSObject *, void *, IOExternalMethodArguments *);
+    static IOReturn sKStatus(OSObject *, void *, IOExternalMethodArguments *);
+    static IOReturn sKScanChunk(OSObject *, void *, IOExternalMethodArguments *);
 
 private:
     RTW88Server *fOwner = nullptr;
@@ -1102,6 +1106,8 @@ static const IOExternalMethodDispatch sMethods[kBridgeNumMethods] = {
     [kBridgeKScan]       = { &RTW88ServerUserClient::sKScan,       0, 0, 0, sizeof(struct rtw_scan_result) },
     [kBridgeKConnect]    = { &RTW88ServerUserClient::sKConnect,    0, sizeof(struct rtw_connect_req), 0, sizeof(struct rtw_connect_result) },
     [kBridgeKDisconnect] = { &RTW88ServerUserClient::sKDisconnect, 0, 0, 0, 0 },
+    [kBridgeKStatus]     = { &RTW88ServerUserClient::sKStatus,     0, 0, 0, sizeof(struct rtw_status_result) },
+    [kBridgeKScanChunk]  = { &RTW88ServerUserClient::sKScanChunk,  0, sizeof(struct rtw_scan_chans), 0, sizeof(struct rtw_scan_result) },
 };
 
 bool RTW88ServerUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
@@ -1300,6 +1306,25 @@ IOReturn RTW88ServerUserClient::sKDisconnect(OSObject *t, void *, IOExternalMeth
 {
     RTW88Server *o = RTW88ServerUserClient_owner(UC(t)); if (!o) return kIOReturnNotAttached;
     rtw_kctl_disconnect();
+    return kIOReturnSuccess;
+}
+/* report the live connection state (kext is the source of truth -> GUI sync). */
+IOReturn RTW88ServerUserClient::sKStatus(OSObject *t, void *, IOExternalMethodArguments *a)
+{
+    RTW88Server *o = RTW88ServerUserClient_owner(UC(t)); if (!o) return kIOReturnNotAttached;
+    if (!a->structureOutput || a->structureOutputSize < sizeof(struct rtw_status_result))
+        return kIOReturnNoSpace;
+    rtw_kctl_status((struct rtw_status_result *)a->structureOutput);
+    return kIOReturnSuccess;
+}
+/* scan a subset of channels (BEGIN brings up, END tears down) -> streamed scan. */
+IOReturn RTW88ServerUserClient::sKScanChunk(OSObject *t, void *, IOExternalMethodArguments *a)
+{
+    RTW88Server *o = RTW88ServerUserClient_owner(UC(t)); if (!o) return kIOReturnNotAttached;
+    if (!a->structureInput  || a->structureInputSize  < sizeof(struct rtw_scan_chans))  return kIOReturnBadArgument;
+    if (!a->structureOutput || a->structureOutputSize < sizeof(struct rtw_scan_result)) return kIOReturnNoSpace;
+    rtw_kctl_scan_chunk((const struct rtw_scan_chans *)a->structureInput,
+                        (struct rtw_scan_result *)a->structureOutput);
     return kIOReturnSuccess;
 }
 

@@ -17,6 +17,7 @@
 extern const struct rtw_table rtw8821c_mac_tbl;
 extern const struct rtw_table rtw8821c_bb_tbl;
 extern const struct rtw_table rtw8821c_agc_tbl;
+extern const struct rtw_table rtw8821c_agc_btg_type2_tbl;   /* BTG-module RX AGC overlay */
 extern const struct rtw_table rtw8821c_rf_a_tbl;
 
 static u32 g_cfg_count;   /* entries applied in the current table load */
@@ -191,6 +192,15 @@ int phy_set_param(struct rtw_dev *rtwdev)
     load_one(rtwdev, &rtw8821c_mac_tbl, "mac");
     u32 bb  = load_one(rtwdev, &rtw8821c_bb_tbl, "bb");
     u32 agc = load_one(rtwdev, &rtw8821c_agc_tbl, "agc");
+
+    /* BTG-module RX AGC overlay (rtw_phy_load_tables: rfe_def->agc_btg_tbl).
+     * Upstream's rtw8821c_rfe_defs maps ONLY rfe_option 2 and 4 to
+     * rtw8821c_agc_btg_type2_tbl; those modules route 2.4GHz through the BT-shared
+     * front-end whose LNA needs different RX gain tables. Without this overlay the
+     * 2.4GHz RX runs the default (WLG) gain curve -> poor sensitivity, downlink
+     * collapses to near-zero (the ~40kbps / ping-timeout symptom). 5GHz is unaffected. */
+    if (rtwdev->efuse.rfe_option == 0x2 || rtwdev->efuse.rfe_option == 0x4)
+        agc += load_one(rtwdev, &rtw8821c_agc_btg_type2_tbl, "agcB");
 
     /* RF: read RF reg 0x00 before/after the table load as an
      * RF-alive check (RF read is direct MMIO at rf_base + addr*4). */

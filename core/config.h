@@ -52,4 +52,10 @@ int parse_args(int argc, char **argv);
  * passphrase); else NULL. Used to pick a join target from the scan results. */
 const struct wifi_network *network_match(const char *ssid);
 
+/* Runtime config persistence (rtwd remembers networks the GUI connects to). */
+int config_load_file(const char *path);                       /* populate g_cfg from file (missing = empty) */
+int config_set_network(const char *ssid, const char *pass);   /* add or update a saved network */
+int config_forget_network(const char *ssid);                  /* remove a saved network (0 = removed) */
+int config_save(const char *path);                            /* rewrite the file from g_cfg (0600) */
+
 #endif /* RTW88_CONFIG_H */

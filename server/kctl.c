@@ -24,6 +24,21 @@ const struct wifi_network *network_match(const char *ssid) { (void)ssid; return 
 /* BAR2 base — set by RTW88Server::start() once mapDeviceMemory succeeds. */
 volatile uint8_t *g_kmmio = 0;
 
+/* Live connection state — the single source of truth for "are we connected and to
+ * what", set by rtw_kctl_connect (whoever called it: CLI, rtwd, auto) and cleared
+ * by rtw_kctl_disconnect. rtw_kctl_status() reports it so the GUI stays in sync. */
+static int     g_cur_connected = 0;
+static char    g_cur_ssid[33]  = "";
+static uint8_t g_cur_bssid[6]  = {0};
+static uint8_t g_cur_mac[6]    = {0};
+static uint8_t g_cur_channel   = 0;
+
+/* Streamed-scan state: the device is brought up ONCE (BEGIN) and kept up across
+ * chunk calls so the daemon can scan a few channels at a time and stream results,
+ * then torn down (END). g_scan_dev persists across the BEGIN/chunk/END calls. */
+static struct rtw_dev g_scan_dev;
+static int            g_scan_active = 0;
+
 /* ---- MMIO shim: the control C lands here (rtw_read8 -> hw_read8 ...) ---- */
 uint8_t  hw_read8 (uint32_t off) { return g_kmmio ? g_kmmio[off] : (uint8_t)0xff; }
 uint16_t hw_read16(uint32_t off) { return g_kmmio ? *(volatile uint16_t *)(g_kmmio + off) : (uint16_t)0xffff; }
@@ -160,7 +175,8 @@ uint32_t rtw_kctl_scan(struct rtw_scan_result *out)
           pr, tr, fr, mcufw, mr, er, pe, rxok, m[0], m[1], m[2], m[3], m[4], m[5]);
 
     fw_handshake(&d);
-    d.hal.rfe_btg = false;
+    /* hal.rfe_btg is derived from efuse.rfe_option in efuse_read() above — it
+     * selects the 2.4GHz RF front-end (BTG vs WLG). Do NOT clobber it here. */
     coex_wifi_antenna(&d);
 
     int n = scan_networks(&d, chans, (int)sizeof(chans), 300);
@@ -169,6 +185,48 @@ uint32_t rtw_kctl_scan(struct rtw_scan_result *out)
     IOLog("RTW88 kctl: in-kernel scan found %d networks\n", n);
     trx_free();   /* release the DMA rings (don't leak ~1MB of wired contiguous per call) */
     return (uint32_t)n;
+}
+
+/* Chunked scan: bring the device up once (BEGIN), scan a subset of channels per
+ * call (streaming the results out to the daemon), then tear down (END). Keeps the
+ * device up across calls in g_scan_dev so bring-up isn't repeated per chunk. */
+void rtw_kctl_scan_chunk(const struct rtw_scan_chans *in, struct rtw_scan_result *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    if (in->flags & RTW_SCAN_F_BEGIN) {
+        /* same no-IOMMU hazard as connect: a scan while connected would reallocate
+         * the rings + reset the MAC under the live data path. Tear it down first. */
+        hw_data_stop();
+        trx_free();                      /* halt DMA + free any prior scan/connection rings */
+        g_scan_active   = 0;
+        g_cur_connected = 0;
+        kdev_init(&g_scan_dev);
+        hw_power(1, 1);                  /* re-enable PCI mem + bus-mastering (prior trx_free off'd it) */
+        rtw_mac_power_on(&g_scan_dev);
+        hw_set_mac_power(1);
+        trx_init(&g_scan_dev);
+        download_firmware(&g_scan_dev, rtw8821c_fw_data, rtw8821c_fw_data_len);
+        mac_init(&g_scan_dev);
+        efuse_read(&g_scan_dev);
+        phy_set_param(&g_scan_dev);
+        fw_handshake(&g_scan_dev);
+        coex_wifi_antenna(&g_scan_dev);
+        g_scan_active = 1;
+        IOLog("RTW88 kctl: scan BEGIN (device up)\n");
+    }
+
+    if (g_scan_active && in->count) {
+        unsigned cnt = in->count > sizeof(in->ch) ? (unsigned)sizeof(in->ch) : in->count;
+        int n = scan_networks(&g_scan_dev, in->ch, (int)cnt, 250);
+        if (n < 0) n = 0;
+        scan_marshal(out);   /* this chunk's networks (scan_networks resets the list per call) */
+    }
+
+    if (in->flags & RTW_SCAN_F_END) {
+        if (g_scan_active) { trx_free(); g_scan_active = 0; }
+        IOLog("RTW88 kctl: scan END (device down)\n");
+    }
 }
 
 /* full in-kernel CONNECT — bring-up + scan (to locate the SSID) + 802.11 auth +
@@ -187,9 +245,24 @@ void rtw_kctl_connect(const struct rtw_connect_req *req, struct rtw_connect_resu
         132, 136, 140, 149, 153, 157, 161, 165, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
     };
     memset(out, 0, sizeof(*out));
+
+    /* CRITICAL (no-IOMMU): tear down any data path / scan rings from a PREVIOUS
+     * connection BEFORE re-running power-on + trx_init. The GUI/auto-connect can
+     * issue a connect while already connected (e.g. switching 5GHz->2.4GHz); without
+     * this, trx_init reallocates the DMA rings and the power-on sequence resets the
+     * MAC while the old RX thread + hardware DMA are still live -> the chip latches a
+     * half-programmed ring base and bus-masters to a garbage physical address ->
+     * RAM corruption -> system freeze. hw_data_stop() joins the old RX thread;
+     * trx_free() then halts DMA + disables bus-mastering before we free/realloc. Both
+     * are safe no-ops if nothing is running. */
+    hw_data_stop();
+    trx_free();
+    g_scan_active   = 0;
+    g_cur_connected = 0;
+
     struct rtw_dev d;
     kdev_init(&d);
-    hw_power(1, 1);   /* re-enable PCI mem + bus-mastering (a prior --kdisconnect's trx_free turned it off) */
+    hw_power(1, 1);   /* re-enable PCI mem + bus-mastering (the teardown above turned it off) */
     rtw_mac_power_on(&d);
     hw_set_mac_power(1);
     trx_init(&d);
@@ -198,7 +271,8 @@ void rtw_kctl_connect(const struct rtw_connect_req *req, struct rtw_connect_resu
     efuse_read(&d);
     phy_set_param(&d);
     fw_handshake(&d);
-    d.hal.rfe_btg = false;
+    /* hal.rfe_btg is derived from efuse.rfe_option in efuse_read() above — it
+     * selects the 2.4GHz RF front-end (BTG vs WLG). Do NOT clobber it here. */
     coex_wifi_antenna(&d);
 
     scan_networks(&d, chans, (int)sizeof(chans), 300);
@@ -230,7 +304,16 @@ void rtw_kctl_connect(const struct rtw_connect_req *req, struct rtw_connect_resu
         cfg.rate    = g_session.init_rate;
         cfg.rate_id = g_session.raid;
         int data_up = (hw_data_start(&cfg) == 0);
-        if (data_up) { hw_data_link(1); IOLog("RTW88 kctl: in-kernel data path UP (enX)\n"); }
+        if (data_up) {
+            hw_data_link(1); IOLog("RTW88 kctl: in-kernel data path UP (enX)\n");
+            /* publish the live connection state (single source of truth for status) */
+            g_cur_connected = 1;
+            strncpy(g_cur_ssid, req->ssid, sizeof(g_cur_ssid) - 1);
+            g_cur_ssid[sizeof(g_cur_ssid) - 1] = 0;
+            memcpy(g_cur_bssid, bssid, 6);
+            memcpy(g_cur_mac, d.efuse.addr, 6);
+            g_cur_channel = channel;
+        }
         else         IOLog("RTW88 kctl: hw_data_start FAILED\n");
         memcpy(out->mac, d.efuse.addr, 6);
         out->status = 1u | ((uint32_t)associated << 1) | ((uint32_t)wpa << 2) | ((uint32_t)data_up << 3);
@@ -247,5 +330,22 @@ void rtw_kctl_disconnect(void)
 {
     hw_data_stop();   /* remove enX + stop the RX thread */
     trx_free();       /* halt TRX DMA, disable bus-mastering, free the rings */
+    g_cur_connected = 0;
+    g_cur_ssid[0] = 0;
     IOLog("RTW88 kctl: disconnected — enX removed, rings freed\n");
+}
+
+/* report the live connection state (set by the last connect, cleared by
+ * disconnect). The kext is authoritative, so a CLI-initiated connect is visible
+ * to rtwd/GUI here even though it never went through rtwd. */
+void rtw_kctl_status(struct rtw_status_result *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->connected = g_cur_connected ? 1 : 0;
+    if (g_cur_connected) {
+        memcpy(out->mac, g_cur_mac, 6);
+        memcpy(out->bssid, g_cur_bssid, 6);
+        out->channel = g_cur_channel;
+        strncpy(out->ssid, g_cur_ssid, sizeof(out->ssid) - 1);
+    }
 }

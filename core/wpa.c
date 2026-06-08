@@ -265,15 +265,22 @@ int wpa_handshake(struct rtw_dev *rtwdev, const u8 *bssid,
     printf("  M2 sent (SNonce + MIC)\n");
 
     /* --- M3: AP replies if our MIC/PSK is correct --- */
+    /* Retry generously: on a marginal 2.4GHz link M2 or M3 is easily lost, and the
+     * symptom is exactly "no valid M3". 8 x 600ms ~= 5s of retries, and we resend M2
+     * both on timeout AND whenever the AP retransmits M1 (it does that when it didn't
+     * hear our M2) — so we react to the AP's retransmit instead of waiting it out. */
     int ok = 0;
-    for (int t = 0; t < 4 && !ok; t++) {
-        elen = recv_eapol(rtwdev, bssid, eapol, sizeof(eapol), 800);
-        if (!elen) { /* retransmit M2 */
+    for (int t = 0; t < 8 && !ok; t++) {
+        elen = recv_eapol(rtwdev, bssid, eapol, sizeof(eapol), 600);
+        if (!elen) { /* timeout -> retransmit M2 */
             trx_tx_data(rtwdev, frame, hl + m2, rate, 0, 0);
             continue;
         }
         u16 ki = get_be16(eapol + 4 + 1);
-        if (!(ki & 0x0100)) continue;            /* want a MIC frame (M3) */
+        if (!(ki & 0x0100)) {                    /* not a MIC frame: an M1 retransmit */
+            trx_tx_data(rtwdev, frame, hl + m2, rate, 0, 0);   /* answer it with M2 again */
+            continue;
+        }
         /* verify M3 MIC with our KCK */
         u8 want[16]; memcpy(want, eapol + 81, 16);
         u8 got[16]; eapol_mic(g_kck, eapol, elen, got);

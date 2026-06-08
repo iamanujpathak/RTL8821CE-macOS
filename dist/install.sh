@@ -43,6 +43,17 @@ if [ "$GUI" = "1" ]; then
 	cp -R build/client/RTW88Menu.app /Applications/
 	chown -R "$RUSER" /Applications/RTW88Menu.app
 
+	# config file: rtwd reads known networks from here and saves new ones the GUI
+	# connects to (so they reconnect password-free + auto-connect on boot).
+	if [ ! -f /usr/local/etc/rtw88.conf ]; then
+		mkdir -p /usr/local/etc
+		cp client/rtw88.conf.example /usr/local/etc/rtw88.conf
+		chmod 600 /usr/local/etc/rtw88.conf
+		echo "    wrote /usr/local/etc/rtw88.conf  (rtwd will append networks you join)"
+	else
+		echo "    kept existing /usr/local/etc/rtw88.conf"
+	fi
+
 	# rtwd LaunchDaemon (NOT the auto-connect client one)
 	launchctl bootout system/com.rtw88.client 2>/dev/null || true
 	rm -f /Library/LaunchDaemons/com.rtw88.client.plist
@@ -50,19 +61,29 @@ if [ "$GUI" = "1" ]; then
 	chown root:wheel /Library/LaunchDaemons/com.rtw88.rtwd.plist
 	chmod 644 /Library/LaunchDaemons/com.rtw88.rtwd.plist
 
+	# menu-bar app LaunchAgent — starts the GUI at login + keeps it alive (no Quit)
+	cp dist/com.rtw88.menu.plist /Library/LaunchAgents/
+	chown root:wheel /Library/LaunchAgents/com.rtw88.menu.plist
+	chmod 644 /Library/LaunchAgents/com.rtw88.menu.plist
+
+	# load both now, in the right domains (daemon = system, agent = the user's GUI)
+	UID_RUSER="$(id -u "$RUSER")"
+	launchctl bootstrap system /Library/LaunchDaemons/com.rtw88.rtwd.plist 2>/dev/null || true
+	launchctl bootout    "gui/$UID_RUSER/com.rtw88.menu" 2>/dev/null || true
+	launchctl bootstrap  "gui/$UID_RUSER" /Library/LaunchAgents/com.rtw88.menu.plist 2>/dev/null || true
+
 	cat <<EOF
 
-Done (GUI mode). Next:
+Done (GUI mode). The rtwd daemon and the menu-bar app are installed and started,
+and both auto-start on boot/login.
   1. First-ever kext install: approve "RTW88Server" in
      System Settings > Privacy & Security, then reboot once.
-  2. Start the daemon now (or it auto-starts on boot):
-        sudo launchctl bootstrap system /Library/LaunchDaemons/com.rtw88.rtwd.plist
-     Watch:  tail -f /var/log/rtw88d.log
-  3. Launch the menu-bar app:
-        open /Applications/RTW88Menu.app
-     (add it to Login Items to start automatically). Click the Wi-Fi icon to
-     scan / connect. To stop the daemon:
-        sudo launchctl bootout system/com.rtw88.rtwd
+  2. rtwd auto-connects to the strongest saved network. Join a new one from the
+     menu (Wi-Fi icon) once; its password is saved to /usr/local/etc/rtw88.conf
+     and reused automatically afterwards.
+  Logs:   tail -f /var/log/rtw88d.log
+  Stop daemon:   sudo launchctl bootout system/com.rtw88.rtwd
+  Stop the menu: sudo launchctl bootout gui/$UID_RUSER/com.rtw88.menu
 EOF
 	exit 0
 fi

@@ -63,10 +63,14 @@ void hw_data_stats(uint64_t out[21]);
 /* trigger in-kernel power-on / full bring-up / scan / connect. */
 struct rtw_scan_result;
 struct rtw_connect_result;
+struct rtw_status_result;
+struct rtw_scan_chans;
 uint32_t hw_kctl_poweron(void);   /* (ret<<16)|(CR<<8)|poweron */
 uint32_t hw_kctl_bringup(void);   /* (ok<<16)|MCUFW_CTRL       */
 int      hw_kctl_scan(struct rtw_scan_result *r);   /* fills r, returns count or -1 */
 int      hw_kctl_connect(const char *ssid, const char *pass, struct rtw_connect_result *res);
 int      hw_kctl_disconnect(void);   /* remove enX + free rings (switch back to other ifaces) */
+int      hw_kctl_status(struct rtw_status_result *st);   /* live connection state (kext truth) */
+int      hw_kctl_scan_chunk(const struct rtw_scan_chans *in, struct rtw_scan_result *r);   /* scan a channel subset (streamed) */
 
 #endif /* RTW_HW_H */

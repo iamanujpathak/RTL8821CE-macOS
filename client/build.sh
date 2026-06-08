@@ -28,5 +28,5 @@ echo "built ./$OUT/RTW88Client   (run: sudo ./$OUT/RTW88Client --config rtw88.co
 # rtwd — the HeliPort-style control daemon (root LaunchDaemon backing the menu-bar app).
 # Reuses the kext ABI via rtw_hw.o (built above); no radio logic of its own.
 clang $CFLAGS -c client/rtwd.c -o "$OUT/rtwd.o"
-clang -arch x86_64 "$OUT/rtwd.o" "$OUT/rtw_hw.o" -framework IOKit -framework CoreFoundation -o "$OUT/rtwd"
+clang -arch x86_64 "$OUT/rtwd.o" "$OUT/rtw_hw.o" "$OUT/config.o" -framework IOKit -framework CoreFoundation -o "$OUT/rtwd"
 echo "built ./$OUT/rtwd          (run: sudo ./$OUT/rtwd   then: echo scan | nc -U /var/run/rtw88d.sock)"

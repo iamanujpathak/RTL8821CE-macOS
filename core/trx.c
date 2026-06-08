@@ -53,6 +53,7 @@ static u64   g_rxbd_handle, g_rxbd_paddr;   static u8 *g_rxbd_vaddr;
 static u64   g_rxdata_handle, g_rxdata_paddr; static u8 *g_rxdata_vaddr;
 static int   g_rx_ok;   /* RX ring fully allocated + programmed */
 static u32   g_rx_n = USCAN_RX_DESC_NUM;   /* RX ring depth actually allocated (fallback) */
+static int   g_trx_alloced;   /* DMA buffers allocated once; reused for the kext lifetime */
 
 static struct tx_ring g_tx[RTK_MAX_TX_QUEUE_NUM];
 
@@ -78,6 +79,16 @@ int trx_init(struct rtw_dev *rtwdev)
 {
     u32 bd_sz = rtwdev->chip->tx_buf_desc_sz;     /* 16 */
     u32 rx_bd_sz = rtwdev->chip->rx_buf_desc_sz;  /* 8  */
+
+    /* CRITICAL (no-IOMMU): allocate the DMA buffers ONCE and reuse them for the
+     * kext's lifetime. Freeing + reallocating them across scan/connect/disconnect
+     * churn is the root of the PTE-corruption panics: the chip DMAs received frames
+     * into the RX pool autonomously, so if a buffer is freed while a bus-master write
+     * is in flight, the kernel may have already reused that physical page (e.g. as a
+     * page table) and the DMA stomps it. Keeping the buffers wired + owned means a
+     * stray DMA can only ever land in our own memory. Re-entry just halts (trx_free)
+     * and reprograms the ring registers (trx_reset) — no alloc/free. */
+    if (g_trx_alloced) { trx_reset(rtwdev); return 0; }
 
     /* ---- lay out all TX BD rings inside one DMA handle ---- */
     g_txbd_size = 0;
@@ -133,6 +144,7 @@ int trx_init(struct rtw_dev *rtwdev)
     if (!g_rx_ok)
         rtw_warn(rtwdev, "RX ring alloc failed (even 8 descs) — continuing TX-only");
 
+    g_trx_alloced = 1;   /* buffers now live for the kext's lifetime (never freed during churn) */
     trx_reset(rtwdev);
     return 0;
 }
@@ -311,14 +323,21 @@ int trx_tx_data(struct rtw_dev *rtwdev, const u8 *frame, u32 len, u8 rate, u8 qs
      * table programmed by fw_ra_info). `rate` becomes only the initial hint. EAPOL
      * and in-clear frames (sec_type 0) stay pinned for handshake reliability. */
     int use_ra = (sec_type == 3);
-    u8  rate_id = g_session.raid;   /* the HT/VHT/legacy raid the firmware RA runs for MACID 0 */
+    /* RATE_ID (raid) must match the MODULATION of the rate we transmit. For RA-driven
+     * bulk CCMP data use the negotiated per-peer raid; for a fixed-rate frame (the
+     * EAPOL handshake, sec_type 0) pick the raid by rate exactly like the working mgmt
+     * path (trx_tx_mgmt): CCK raid for CCK rates (1/2/5.5/11M < 6M), OFDM raid above.
+     * Stamping raid 0 here mis-keyed CCK EAPOL frames (2.4GHz M2 at 1M) so they didn't
+     * radiate reliably — the AP never saw M2 and never sent M3 ("no valid M3"). */
+    u8  rate_id = use_ra ? g_session.raid
+                         : (rate < DESC_RATE6M ? RTW_RATEID_B_20M : RTW_RATEID_G);
     u32 *w = (u32 *)g_pkt_vaddr;
     w[0] = le32_encode_bits(air_len, RTW_TX_DESC_W0_TXPKTSIZE) |
            le32_encode_bits(desc_sz, RTW_TX_DESC_W0_OFFSET) |
            le32_encode_bits(1, RTW_TX_DESC_W0_LS);
     w[1] = le32_encode_bits(qsel, RTW_TX_DESC_W1_QSEL) |
            le32_encode_bits(sec_type, RTW_TX_DESC_W1_SEC_TYPE) |
-           le32_encode_bits(use_ra ? rate_id : 0, RTW_TX_DESC_W1_RATE_ID);  /* MACID 0 implicit */
+           le32_encode_bits(rate_id, RTW_TX_DESC_W1_RATE_ID);  /* MACID 0 implicit */
     if (!use_ra)
         w[3] = le32_encode_bits(1, RTW_TX_DESC_W3_USE_RATE) |
                le32_encode_bits(1, RTW_TX_DESC_W3_DISDATAFB);
@@ -400,20 +419,15 @@ void trx_fill_data_cfg(struct rtw_dev *rtwdev, struct rtw_data_cfg *cfg)
 
 void trx_free(void)
 {
-    /* CRITICAL (no IOMMU): stop the chip bus-mastering BEFORE we free the DMA
-     * buffers. Otherwise the chip keeps DMA-ing received frames into physical
-     * memory the kernel has reused (GPU/framebuffer) -> corruption + freeze,
-     * continuing even after this process exits. Halt RX/TX DMA, drop the ring
-     * base registers, disable PCI bus mastering, then let in-flight DMA settle. */
+    /* HALT DMA ONLY — never free the buffers (see trx_init: allocate-once). On this
+     * no-IOMMU box, freeing a buffer the chip might still bus-master into is what
+     * corrupts kernel RAM (the PTE-corruption panics). So we quiesce the chip but
+     * keep every buffer wired + owned: stop RX/TX DMA, drop the ring base registers,
+     * disable PCI bus mastering, and let any in-flight DMA settle. The next bring-up
+     * reuses these same buffers via trx_init -> trx_reset. */
     hw_write16(RTK_PCI_RXBD_NUM_MPDUQ, 0);     /* RX ring length 0 */
     hw_write32(RTK_PCI_RXBD_DESA_MPDUQ, 0);    /* clear RX ring base */
     hw_write8(REG_CR, 0);                      /* stop MAC TRX DMA engines */
     hw_power(true, false);                     /* disable PCI bus mastering */
     usleep(30000);                             /* let any in-flight DMA drain */
-
-    if (g_txbd_vaddr)   hw_dma_free(g_txbd_handle, g_txbd_vaddr, g_txbd_size);
-    if (g_pkt_vaddr)    hw_dma_free(g_pkt_handle, g_pkt_vaddr, g_pkt_size);
-    if (g_rxbd_vaddr)   hw_dma_free(g_rxbd_handle, g_rxbd_vaddr, (u64)g_rx_n * 8);
-    if (g_rxdata_vaddr) hw_dma_free(g_rxdata_handle, g_rxdata_vaddr, (u64)g_rx_n * USCAN_RX_BUF_SIZE);
-    g_txbd_vaddr = g_pkt_vaddr = g_rxbd_vaddr = g_rxdata_vaddr = NULL;
 }

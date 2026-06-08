@@ -152,12 +152,28 @@ int efuse_read(struct rtw_dev *rtwdev)
         rtwdev->efuse.rf_board_option = 0;
     rtwdev->efuse.btcoex = (rtwdev->efuse.rf_board_option & 0xe0) == 0x20;
 
+    /* rfe_btg (rtw8821c_read_efuse, verbatim): these RFE module types route 2.4GHz
+     * WiFi through the BT-shared (BTG) front-end, so set_channel_rf must SWITCH_TO_BTG
+     * on 2.4GHz. Getting this wrong sends 2.4GHz out the WLG port (no antenna on a
+     * BTG module) -> the link associates but can't pass data (no DHCP/IP). 5GHz always
+     * uses WLA so it is unaffected. */
+    switch (rtwdev->efuse.rfe_option) {
+    case 0x2: case 0x4: case 0x7: case 0xa: case 0xc: case 0xf:
+        rtwdev->hal.rfe_btg = true;
+        break;
+    default:
+        rtwdev->hal.rfe_btg = false;
+        break;
+    }
+
     /* transparency: dump the parsed field region so decode alignment is visible.
      * 0xB8 chan_plan, 0xB9 xtal, 0xC1 board, 0xCA rfe, 0xD0..D5 MAC. Structured
      * (non-0xff) data here = the physical read + RLE decode landed correctly. */
     printf("  efuse[0xB8..0xD5]:");
     for (u32 o = 0xB8; o <= 0xD5; o++) printf(" %02x", log_map[o]);
-    printf("\n");
+    printf("\n  rfe_option=0x%02x -> rfe_btg=%d (2.4GHz RF front-end: %s)\n",
+           rtwdev->efuse.rfe_option, rtwdev->hal.rfe_btg,
+           rtwdev->hal.rfe_btg ? "BTG" : "WLG");
     ret = 0;
 
 out:

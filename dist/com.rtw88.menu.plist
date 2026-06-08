@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.rtw88.menu</string>
+
+	<!-- LaunchAgent for the RTW88 menu-bar app. Runs in the console user's GUI
+	     (Aqua) session, starts at login, and is kept alive so it relaunches if it
+	     ever exits — there is no Quit in the UI, and this enforces "always running".
+	     The app is pure UI; it talks to the root rtwd daemon over the Unix socket. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Applications/RTW88Menu.app/Contents/MacOS/RTW88Menu</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+
+	<!-- only load in a GUI login session (a menu-bar app needs the Aqua session) -->
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+</dict>
+</plist>

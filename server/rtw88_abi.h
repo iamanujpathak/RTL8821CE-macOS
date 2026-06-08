@@ -18,7 +18,7 @@
 
 /* Bump if the selector numbers / arg layout change. PING returns it so the
  * userspace side can refuse a mismatched kext. */
-#define RTW_BRIDGE_ABI_VERSION   11  /* v11: dropped the legacy userspace eth-relay nub */
+#define RTW_BRIDGE_ABI_VERSION   13  /* v13: + kBridgeKScanChunk (streamed chunked scan) */
 #define RTW_BRIDGE_PING_MAGIC     0x52545742u   /* 'RTWB' */
 
 /* Max concurrent DMA buffers. A DMA handle is also the IOConnectMapMemory
@@ -52,7 +52,9 @@ enum {
     kBridgeKScan      = 20, /* in:0  structOut: rtw_scan_result     bring-up + in-kernel scan */
     kBridgeKConnect   = 21, /* structIn: rtw_connect_req  structOut: rtw_connect_result  in-kernel connect */
     kBridgeKDisconnect= 22, /* in:0  out:0  remove enX + free rings */
-    kBridgeNumMethods = 23
+    kBridgeKStatus    = 23, /* in:0  structOut: rtw_status_result  live connection state */
+    kBridgeKScanChunk = 24, /* structIn: rtw_scan_chans  structOut: rtw_scan_result  scan a channel subset (BEGIN brings up, END tears down) — lets the daemon stream results per chunk */
+    kBridgeNumMethods = 25
 };
 
 /* in-kernel connect request (CLI -> kext) + result (kext -> CLI). */
@@ -66,6 +68,32 @@ struct rtw_connect_result {
     uint8_t  mac[6];     /* the card's MAC — so the CLI can find enX + DHCP it */
     uint8_t  channel;
     uint8_t  _pad;
+};
+
+/* Live connection state (kext -> any client). The kext is the single source of
+ * truth: whoever ran the last connect (CLI, rtwd, auto), this reflects reality,
+ * so the GUI stays in sync even when a connection was made behind rtwd's back. */
+struct rtw_status_result {
+    uint32_t connected;  /* in-kext data path running */
+    uint8_t  mac[6];     /* card MAC (find enX)        */
+    uint8_t  bssid[6];   /* AP we're on               */
+    uint8_t  channel;
+    uint8_t  _pad;
+    char     ssid[33];   /* SSID of the current connection */
+    uint8_t  _pad2[3];
+};
+
+/* Chunked-scan request (daemon -> kext). The daemon scans a few channels at a
+ * time so it can stream results to the GUI as each chunk completes, instead of
+ * blocking ~11s for one batched result. BEGIN runs the bring-up once and leaves
+ * the device up across calls; END tears it down. A call may carry channels and
+ * BEGIN/END together (e.g. a single-chunk scan sets both). */
+#define RTW_SCAN_F_BEGIN  0x1
+#define RTW_SCAN_F_END    0x2
+struct rtw_scan_chans {
+    uint32_t flags;        /* RTW_SCAN_F_* */
+    uint32_t count;        /* channels in ch[] to scan this call (may be 0 for a pure BEGIN/END) */
+    uint8_t  ch[40];
 };
 
 /* scan results, marshalled from scan.c's network list to the CLI. */

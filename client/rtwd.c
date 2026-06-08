@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -36,15 +37,25 @@
 #include <arpa/inet.h>
 
 #include "rtw_hw.h"
+#include "config.h"
 #include "../server/rtw88_abi.h"
 
 #define RTWD_SOCK_PATH "/var/run/rtw88d.sock"
+#define RTWD_CONF_PATH "/usr/local/etc/rtw88.conf"
 
-/* last successful connection, so `status` can describe it (the kext doesn't keep SSID). */
-static char    g_ssid[33] = "";
-static uint8_t g_mac[6]    = {0};
-static int     g_channel   = 0;
-static int     g_connected = 0;
+/* The kext is the source of truth for the live connection (see hw_kctl_status),
+ * so rtwd holds almost no connection state of its own — only the policy bits:
+ *   g_kext_lock : serialize kext access (rtw_hw_open/close uses a shared global
+ *                 handle, so the accept loop and the auto-connect thread must not
+ *                 overlap).
+ *   g_user_off  : the GUI/CLI asked to disconnect on purpose — pause auto-connect
+ *                 until the next explicit connect, so we don't instantly rejoin. */
+static pthread_mutex_t g_kext_lock = PTHREAD_MUTEX_INITIALIZER;
+static int             g_user_off  = 0;
+static int             g_radio_off = 0;   /* radio powered off (GUI power switch) */
+
+static void kext_lock(void)   { pthread_mutex_lock(&g_kext_lock); }
+static void kext_unlock(void) { pthread_mutex_unlock(&g_kext_lock); }
 
 /* ---- enX bring-up (identical to the CLI's userspace step) ----------------- */
 static int find_ifname(const uint8_t *mac, char *out, size_t outsz)
@@ -133,37 +144,97 @@ static void appendf(char *dst, size_t cap, size_t *len, const char *fmt, ...)
 }
 
 /* ---- command handlers (write a JSON reply line into `out`) ---------------- */
-static void cmd_scan(char *out, size_t cap)
+/* send a full buffer to a client fd (used by the streaming scan). */
+static void send_all(int fd, const char *s)
 {
-    if (rtw_hw_open() != 0) { snprintf(out, cap, "{\"ok\":false,\"error\":\"kext not reachable (loaded? root?)\"}\n"); return; }
-    static struct rtw_scan_result sr;   /* large — keep off the stack */
-    int n = hw_kctl_scan(&sr);
-    rtw_hw_close();
-    if (n < 0) { snprintf(out, cap, "{\"ok\":false,\"error\":\"scan failed\"}\n"); return; }
+    size_t n = strlen(s), off = 0;
+    while (off < n) { ssize_t w = send(fd, s + off, n - off, 0); if (w <= 0) break; off += (size_t)w; }
+}
 
+/* serialize one scan entry as a {"network":{...}} line into buf. */
+static void net_line(char *buf, size_t cap, const struct rtw_scan_entry *e)
+{
     size_t len = 0;
-    appendf(out, cap, &len, "{\"ok\":true,\"networks\":[");
-    for (unsigned k = 0; k < sr.count; k++) {
-        const struct rtw_scan_entry *e = &sr.nets[k];
-        if (k) appendf(out, cap, &len, ",");
-        appendf(out, cap, &len, "{\"ssid\":");
-        json_str(out, cap, &len, e->ssid);
-        appendf(out, cap, &len,
-                ",\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"channel\":%u,\"band\":\"%s\",\"beacons\":%u}",
-                e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5],
-                e->channel, e->channel <= 14 ? "2.4" : "5", e->beacons);
+    appendf(buf, cap, &len, "{\"network\":{\"ssid\":");
+    json_str(buf, cap, &len, e->ssid);
+    appendf(buf, cap, &len,
+            ",\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"channel\":%u,\"band\":\"%s\",\"beacons\":%u,\"saved\":%s}}\n",
+            e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5],
+            e->channel, e->channel <= 14 ? "2.4" : "5", e->beacons,
+            network_match(e->ssid) ? "true" : "false");
+}
+
+/* Streaming scan: scan the channel list a few channels at a time and emit each
+ * newly-seen network as its own JSON line as soon as its chunk completes, then a
+ * final {"done":true}. The GUI appends rows live instead of waiting ~11s. */
+static void cmd_scan(int fd)
+{
+    static const unsigned char chans[] = {
+        36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+        132, 136, 140, 149, 153, 157, 161, 165,                 /* 5 GHz */
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13               /* 2.4 GHz */
+    };
+    const int total = (int)sizeof(chans), CHUNK = 6;
+
+    if (g_radio_off) { send_all(fd, "{\"ok\":false,\"error\":\"radio is off\"}\n"); return; }
+
+    kext_lock();
+    if (rtw_hw_open() != 0) { kext_unlock(); send_all(fd, "{\"ok\":false,\"error\":\"kext not reachable\"}\n"); return; }
+    send_all(fd, "{\"ok\":true,\"scanning\":true}\n");
+
+    uint8_t seen[128][6]; int nseen = 0;
+    static struct rtw_scan_result sr;
+    for (int off = 0; off < total; off += CHUNK) {
+        struct rtw_scan_chans in;
+        memset(&in, 0, sizeof in);
+        in.flags = (off == 0 ? RTW_SCAN_F_BEGIN : 0) | (off + CHUNK >= total ? RTW_SCAN_F_END : 0);
+        in.count = (off + CHUNK <= total) ? (uint32_t)CHUNK : (uint32_t)(total - off);
+        memcpy(in.ch, chans + off, in.count);
+
+        if (hw_kctl_scan_chunk(&in, &sr) < 0) continue;
+        for (unsigned k = 0; k < sr.count; k++) {
+            const struct rtw_scan_entry *e = &sr.nets[k];
+            int dup = 0;
+            for (int j = 0; j < nseen; j++) if (memcmp(seen[j], e->bssid, 6) == 0) { dup = 1; break; }
+            if (dup) continue;
+            if (nseen < 128) memcpy(seen[nseen++], e->bssid, 6);
+            char line[512];
+            net_line(line, sizeof line, e);
+            send_all(fd, line);
+        }
     }
-    appendf(out, cap, &len, "]}\n");
+    rtw_hw_close();
+    kext_unlock();
+    send_all(fd, "{\"ok\":true,\"done\":true}\n");
+}
+
+/* run an in-kernel connect under the kext lock. Fills *res; returns the
+ * hw_kctl_connect rc (0 = call ok), or -2 if the kext isn't reachable. */
+static int kconnect(const char *ssid, const char *pass, struct rtw_connect_result *res)
+{
+    memset(res, 0, sizeof *res);
+    kext_lock();
+    if (rtw_hw_open() != 0) { kext_unlock(); return -2; }
+    int rc = hw_kctl_connect(ssid, pass ? pass : "", res);
+    rtw_hw_close();
+    kext_unlock();
+    return rc;
 }
 
 static void cmd_connect(const char *ssid, const char *pass, char *out, size_t cap)
 {
     if (!ssid || !ssid[0]) { snprintf(out, cap, "{\"ok\":false,\"error\":\"missing ssid\"}\n"); return; }
-    if (rtw_hw_open() != 0) { snprintf(out, cap, "{\"ok\":false,\"error\":\"kext not reachable\"}\n"); return; }
+    if (g_radio_off)       { snprintf(out, cap, "{\"ok\":false,\"error\":\"radio is off\"}\n"); return; }
+
+    /* no password given? fall back to a saved one for this SSID (known network). */
+    const char *use_pass = (pass && pass[0]) ? pass : NULL;
+    if (!use_pass) { const struct wifi_network *kn = network_match(ssid); if (kn) use_pass = kn->password; }
+
+    g_user_off = 0;   /* an explicit connect re-arms auto-connect */
+
     struct rtw_connect_result res;
-    memset(&res, 0, sizeof res);
-    int rc = hw_kctl_connect(ssid, pass ? pass : "", &res);
-    rtw_hw_close();
+    int rc = kconnect(ssid, use_pass ? use_pass : "", &res);
+    if (rc == -2) { snprintf(out, cap, "{\"ok\":false,\"error\":\"kext not reachable\"}\n"); return; }
 
     int associated = (res.status >> 1) & 1, wpa = (res.status >> 2) & 1, data_up = (res.status >> 3) & 1;
     if (rc != 0 || !data_up) {
@@ -178,13 +249,14 @@ static void cmd_connect(const char *ssid, const char *pass, char *out, size_t ca
         return;
     }
 
-    /* connected — bring enX online + remember it for status. */
+    /* connected — persist this network so it reconnects password-free next time,
+     * then bring enX online (DHCP runs outside the kext lock). */
+    if (use_pass && use_pass[0]) {
+        config_set_network(ssid, use_pass);
+        config_save(RTWD_CONF_PATH);
+    }
     char ifname[IFNAMSIZ] = "";
     data_online(res.mac, ifname, sizeof ifname);
-    strlcpy(g_ssid, ssid, sizeof g_ssid);
-    memcpy(g_mac, res.mac, 6);
-    g_channel = res.channel;
-    g_connected = 1;
 
     size_t len = 0;
     appendf(out, cap, &len, "{\"ok\":true,\"status\":%u,\"channel\":%u,\"ifname\":", res.status, res.channel);
@@ -197,33 +269,128 @@ static void cmd_connect(const char *ssid, const char *pass, char *out, size_t ca
 
 static void cmd_disconnect(char *out, size_t cap)
 {
-    if (rtw_hw_open() != 0) { snprintf(out, cap, "{\"ok\":false,\"error\":\"kext not reachable\"}\n"); return; }
+    g_user_off = 1;   /* deliberate disconnect — don't let auto-connect undo it */
+    kext_lock();
+    if (rtw_hw_open() != 0) { kext_unlock(); snprintf(out, cap, "{\"ok\":false,\"error\":\"kext not reachable\"}\n"); return; }
     int rc = hw_kctl_disconnect();
     rtw_hw_close();
-    g_connected = 0; g_ssid[0] = '\0';
+    kext_unlock();
     snprintf(out, cap, "{\"ok\":%s}\n", rc == 0 ? "true" : "false");
+}
+
+/* drop a saved network (so the GUI can "forget" it). */
+static void cmd_forget(const char *ssid, char *out, size_t cap)
+{
+    if (!ssid || !ssid[0]) { snprintf(out, cap, "{\"ok\":false,\"error\":\"missing ssid\"}\n"); return; }
+    int found = (config_forget_network(ssid) == 0);
+    if (found) config_save(RTWD_CONF_PATH);
+    snprintf(out, cap, "{\"ok\":%s}\n", found ? "true" : "false");
+}
+
+/* power the radio on/off (a Wi-Fi master switch, separate from connect). OFF
+ * tears down any connection + halts the chip (trx_free disables bus-mastering)
+ * and pauses auto-connect; ON re-arms auto-connect (which rejoins a known net). */
+static void cmd_power(const char *arg, char *out, size_t cap)
+{
+    int on = arg && (!strcmp(arg, "on") || !strcmp(arg, "1") || !strcmp(arg, "true"));
+    if (on) {
+        g_radio_off = 0;
+        g_user_off  = 0;   /* let auto-connect bring a known network back */
+    } else {
+        g_radio_off = 1;
+        g_user_off  = 1;
+        kext_lock();
+        if (rtw_hw_open() == 0) { hw_kctl_disconnect(); rtw_hw_close(); }
+        kext_unlock();
+    }
+    snprintf(out, cap, "{\"ok\":true,\"powered\":%s}\n", on ? "true" : "false");
 }
 
 static void cmd_status(char *out, size_t cap)
 {
+    /* the kext is authoritative: a CLI-initiated connect shows up here too. */
+    struct rtw_status_result st;
+    kext_lock();
+    int ok = (rtw_hw_open() == 0);
+    if (ok) { ok = (hw_kctl_status(&st) == 0); rtw_hw_close(); }
+    kext_unlock();
+
     char ifname[IFNAMSIZ] = "", ip[INET_ADDRSTRLEN] = "";
-    if (g_connected && find_ifname(g_mac, ifname, sizeof ifname) == 0)
+    int connected = ok && st.connected;
+    if (connected && find_ifname(st.mac, ifname, sizeof ifname) == 0)
         iface_ipv4(ifname, ip, sizeof ip);
-    else
-        g_connected = 0;   /* enX gone -> not connected */
 
     size_t len = 0;
-    appendf(out, cap, &len, "{\"ok\":true,\"connected\":%s", g_connected ? "true" : "false");
-    if (g_connected) {
+    appendf(out, cap, &len, "{\"ok\":true,\"powered\":%s,\"connected\":%s",
+            g_radio_off ? "false" : "true", connected ? "true" : "false");
+    if (connected) {
         appendf(out, cap, &len, ",\"ssid\":");
-        json_str(out, cap, &len, g_ssid);
+        json_str(out, cap, &len, st.ssid);
         appendf(out, cap, &len, ",\"channel\":%d,\"band\":\"%s\",\"ifname\":",
-                g_channel, g_channel <= 14 ? "2.4" : "5");
+                st.channel, st.channel <= 14 ? "2.4" : "5");
         json_str(out, cap, &len, ifname);
         appendf(out, cap, &len, ",\"ip\":");
         json_str(out, cap, &len, ip);
     }
     appendf(out, cap, &len, "}\n");
+}
+
+/* ---- auto-connect: join the strongest known network, keep the link up ----- *
+ * Runs in its own thread (kext access serialized by g_kext_lock). On boot and
+ * after any drop it scans and connects the best in-range SAVED network with no
+ * prompt — unless the user deliberately disconnected (g_user_off). */
+static void *auto_connect_thread(void *arg)
+{
+    (void)arg;
+    int delay = 3;   /* first attempt shortly after boot */
+    int fails = 0;   /* consecutive failed attempts -> exponential backoff */
+    for (;;) {
+        sleep(delay);
+        delay = 15;
+        if (g_user_off || g_radio_off || g_cfg.n_nets == 0) { fails = 0; continue; }
+
+        /* already connected? (kext is the source of truth) */
+        struct rtw_status_result st;
+        kext_lock();
+        int ok = (rtw_hw_open() == 0);
+        if (ok) { ok = (hw_kctl_status(&st) == 0); rtw_hw_close(); }
+        kext_unlock();
+        if (ok && st.connected) { fails = 0; continue; }
+
+        /* scan, then pick the strongest in-range saved network */
+        static struct rtw_scan_result sr;
+        int n = -1;
+        kext_lock();
+        if (rtw_hw_open() == 0) { n = hw_kctl_scan(&sr); rtw_hw_close(); }
+        kext_unlock();
+        if (n <= 0) continue;
+
+        const struct wifi_network *best = NULL; unsigned best_beacons = 0;
+        for (unsigned k = 0; k < sr.count; k++) {
+            const struct rtw_scan_entry *e = &sr.nets[k];
+            const struct wifi_network *kn = network_match(e->ssid);
+            if (kn && e->beacons >= best_beacons) { best_beacons = e->beacons; best = kn; }
+        }
+        if (!best || g_user_off) continue;   /* re-check g_user_off: user may have acted during the scan */
+
+        struct rtw_connect_result res;
+        int rc = kconnect(best->ssid, best->password, &res);
+        if (rc == 0 && ((res.status >> 3) & 1)) {
+            char ifname[IFNAMSIZ] = "";
+            data_online(res.mac, ifname, sizeof ifname);
+            fprintf(stderr, "rtwd: auto-connected to %s (%s)\n", best->ssid, ifname);
+            fails = 0;
+        } else {
+            /* back off a network that keeps failing (e.g. wrong saved password) so we
+             * don't churn the chip's power-on/DMA-ring setup every 15s: 30s, 60s, 120s. */
+            if (fails < 8) fails++;
+            int mult = fails < 3 ? (1 << fails) : 8;     /* 2,4,8,8,... */
+            delay = 15 * mult; if (delay > 120) delay = 120;
+            fprintf(stderr, "rtwd: auto-connect to %s failed (status 0x%x); retry in %ds\n",
+                    best->ssid, res.status, delay);
+        }
+    }
+    return NULL;
 }
 
 /* ---- one client connection: read a command line, reply, close ------------ */
@@ -240,20 +407,19 @@ static void handle_client(int fd)
     char *t = strchr(req, '\t');
     if (t) { *t = '\0'; a1 = t + 1; char *t2 = strchr(a1, '\t'); if (t2) { *t2 = '\0'; a2 = t2 + 1; } }
 
-    static char out[64 * 1024];   /* scan can be large */
+    /* scan streams multiple JSON lines straight to the socket as chunks complete. */
+    if (!strcmp(verb, "scan")) { cmd_scan(fd); return; }
+
+    static char out[4096];
     out[0] = '\0';
-    if      (!strcmp(verb, "scan"))       cmd_scan(out, sizeof out);
-    else if (!strcmp(verb, "connect"))    cmd_connect(a1, a2, out, sizeof out);
+    if      (!strcmp(verb, "connect"))    cmd_connect(a1, a2, out, sizeof out);
     else if (!strcmp(verb, "disconnect")) cmd_disconnect(out, sizeof out);
     else if (!strcmp(verb, "status"))     cmd_status(out, sizeof out);
+    else if (!strcmp(verb, "forget"))     cmd_forget(a1, out, sizeof out);
+    else if (!strcmp(verb, "power"))      cmd_power(a1, out, sizeof out);
     else snprintf(out, sizeof out, "{\"ok\":false,\"error\":\"unknown command\"}\n");
 
-    size_t n = strlen(out), off = 0;
-    while (off < n) {
-        ssize_t w = send(fd, out + off, n - off, 0);
-        if (w <= 0) break;
-        off += (size_t)w;
-    }
+    send_all(fd, out);
 }
 
 int main(int argc, char **argv)
@@ -273,7 +439,13 @@ int main(int argc, char **argv)
     chmod(RTWD_SOCK_PATH, 0666);
     if (listen(s, 8) != 0) { perror("listen"); return 1; }
 
-    fprintf(stderr, "rtwd: listening on %s\n", RTWD_SOCK_PATH);
+    /* load saved networks, then auto-connect to the strongest known one on boot. */
+    config_load_file(RTWD_CONF_PATH);
+    pthread_t auto_t;
+    if (pthread_create(&auto_t, NULL, auto_connect_thread, NULL) == 0)
+        pthread_detach(auto_t);
+
+    fprintf(stderr, "rtwd: listening on %s (%d known network(s))\n", RTWD_SOCK_PATH, g_cfg.n_nets);
     for (;;) {
         int c = accept(s, NULL, NULL);
         if (c < 0) { if (errno == EINTR) continue; perror("accept"); break; }
