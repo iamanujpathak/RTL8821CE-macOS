@@ -56,7 +56,10 @@ static u32 build_auth_req(u8 *buf, const u8 *sa, const u8 *bssid)
  * shows ~36% of the AP's SNs simply never arrive (err=0, ringFull=0) — the signature of
  * the AP sending 40/80MHz VHT PPDUs our 20MHz-only baseband can't demodulate. Advertising
  * VHT implies >=80MHz; dropping it (HT cap is 20MHz-only) forces the AP to 20MHz HT we can
- * fully receive. Flip back to 1 only once the 40/80MHz baseband path (set_channel_bb) lands. */
+ * fully receive. NOTE: this is the BINDING downlink ceiling — HT-MCS7 @20MHz 1SS +SGI =
+ * 72.2 Mbps PHY (~55-65 Mbps TCP), so a >~70 Mbps WAN cannot be saturated until the
+ * 40/80MHz baseband path lands (the 8821CE is 1x1, so 2 spatial streams aren't an option).
+ * Flip back to 1 only once the 40/80MHz baseband path (set_channel_bb) is ported. */
 #define RTW_ADVERTISE_VHT 0
 
 static u32 build_assoc_req(u8 *buf, const u8 *sa, const u8 *bssid,

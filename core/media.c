@@ -119,7 +119,7 @@ void media_connect(struct rtw_dev *rtwdev, const u8 *bssid, u8 mac_id, u8 channe
     /* Enable firmware rate adaptation for this peer, matched to what the AP granted
      * in the association response (g_session). The firmware then climbs/falls within
      * this rate mask per link quality. Bit layout (verified vs. upstream main.c):
-     *   CCK [3:0]=0xf  OFDM [11:4]=0xff0  HT-MCS0-7 [19:12]=0xff000  VHT-MCS0-9 [29:20]=0x3ff000
+     *   CCK [3:0]=0xf  OFDM [11:4]=0xff0  HT-MCS0-7 [19:12]=0xff000  VHT-MCS0-9 [29:20]=0x3ff00000
      * Bandwidth stays 20MHz here (channel bonding is a later step), so the rates top
      * out at HT MCS7 (~72Mbps SGI) / VHT MCS8 (~86Mbps) on 1 spatial stream. */
     int five = channel > 14;
@@ -136,7 +136,9 @@ void media_connect(struct rtw_dev *rtwdev, const u8 *bssid, u8 mac_id, u8 channe
     const char *mode;
     if (g_session.has_vht) {               /* 802.11ac (5GHz only) */
         raid = five ? RTW_RATEID_ARFR1_AC_1SS : RTW_RATEID_ARFR2_AC_2G_1SS;
-        mask = 0x00000ff0 | 0x003ff000;    /* OFDM | VHT MCS0-9 (1SS) */
+        mask = 0x00000ff0 | 0x3ff00000;    /* OFDM [11:4] | VHT-MCS0-9 1SS [29:20] (was 0x003ff000
+                                            * = bits [21:12], which masked off MCS2-9 and capped the
+                                            * VHT peer at MCS1 — a real downlink-rate floor) */
         if (!five) mask |= 0x0000000f;     /* + CCK on 2.4GHz */
         vht_en = 1; mode = "VHT/11ac";
     } else if (g_session.has_ht) {         /* 802.11n */

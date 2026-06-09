@@ -32,7 +32,19 @@
  * and records the depth it got in g_rx_n — big ring for data-path throughput when
  * memory allows, small ring (still enough for scan beacons) when fragmented. */
 #define USCAN_RX_DESC_NUM  64
-#define USCAN_RX_BUF_SIZE  (11454 + 24)
+/* Per-slot size. The chip DMAs the WHOLE PPDU into one slot as:
+ *   rx_desc(24) + rx_shift(0..3) + drv_info(PHY_STATUS_SIZE*8 bytes) + the MPDU,
+ * and (per the block comment above) it ignores the BD buf_size on an oversize frame.
+ * So the slot MUST cover desc + shift + drv_info + the largest MPDU the HW can hand
+ * us, or a max-size A-MSDU overruns into adjacent system RAM with no IOMMU to trap it.
+ * The parse paths (rxLoop, assoc.c, scan.c) confirm shift+drv_info sit BEFORE the MPDU:
+ * off = rx_desc + shift + drv_info*8. Size for the worst case, rounded up to 8. */
+#define USCAN_RX_PKT_DESC_SZ  24       /* RX_PKT_DESC_SZ */
+#define USCAN_RX_DRVINFO_SZ   32       /* drv_info = PHY_STATUS_SIZE(4) * 8, programmed in macinit */
+#define USCAN_RX_SHIFT_MAX    8        /* rx_shift is 2 bits (<=3); 8 keeps the MPDU 8-aligned */
+#define USCAN_RX_MAX_MPDU     11454    /* VHT A-MSDU max the HW can DMA */
+#define USCAN_RX_BUF_SIZE  ((USCAN_RX_PKT_DESC_SZ + USCAN_RX_SHIFT_MAX + \
+                            USCAN_RX_DRVINFO_SZ + USCAN_RX_MAX_MPDU + 7) & ~7u)
 
 /* per-queue TX ring descriptor */
 struct tx_ring {
@@ -51,6 +63,11 @@ static u64   g_pkt_handle,  g_pkt_paddr;    static u8 *g_pkt_vaddr;   static u64
 /* RX BD ring + RX data pool */
 static u64   g_rxbd_handle, g_rxbd_paddr;   static u8 *g_rxbd_vaddr;
 static u64   g_rxdata_handle, g_rxdata_paddr; static u8 *g_rxdata_vaddr;
+/* per-slot TX buffer pool for the in-kext data path. Allocated ONCE here (like every
+ * other ring) and handed to the kext by handle — so it is NEVER freed during
+ * scan/connect/disconnect churn while the chip may still bus-master-read a queued BE
+ * BD that points into it (the no-IOMMU free-during-DMA corruption class). */
+static u64   g_txpool_handle, g_txpool_paddr; static u8 *g_txpool_vaddr; static u64 g_txpool_size;
 static int   g_rx_ok;   /* RX ring fully allocated + programmed */
 static u32   g_rx_n = USCAN_RX_DESC_NUM;   /* RX ring depth actually allocated (fallback) */
 static int   g_trx_alloced;   /* DMA buffers allocated once; reused for the kext lifetime */
@@ -112,6 +129,15 @@ int trx_init(struct rtw_dev *rtwdev)
     g_pkt_size = 0x2000;
     if (hw_dma_alloc(g_pkt_size, &g_pkt_handle, &g_pkt_paddr, (void **)&g_pkt_vaddr))
         { rtw_err(rtwdev, "TX pkt alloc failed"); return -1; }
+
+    /* ---- per-slot TX buffer pool for the in-kext data path (one slot per BE BD) ----
+     * allocate-once + handed off by handle (see trx_fill_data_cfg); the kext borrows
+     * it and never frees it, so a queued BE BD's in-flight DMA read can only ever land
+     * in our own still-wired memory. */
+    g_txpool_size = (u64)g_tx[RTW_TX_QUEUE_BE].len * RTW_ETH_SLOT_SIZE;
+    if (hw_dma_alloc(g_txpool_size, &g_txpool_handle, &g_txpool_paddr, (void **)&g_txpool_vaddr))
+        { rtw_err(rtwdev, "TX pool alloc failed"); return -1; }
+    memset(g_txpool_vaddr, 0, g_txpool_size);
 
     /* ---- RX ring: BDs + a contiguous data pool (OPTIONAL — fw download needs
      * only TX; don't let a big-contiguous-alloc failure block the fw download) ---- */
@@ -415,6 +441,7 @@ void trx_fill_data_cfg(struct rtw_dev *rtwdev, struct rtw_data_cfg *cfg)
     cfg->rx_nslots   = g_rx_n;
     cfg->rx_buf_size = USCAN_RX_BUF_SIZE;
     cfg->rx_desc_sz  = 24;                              /* RX_PKT_DESC_SZ */
+    cfg->txpool_handle = (u32)g_txpool_handle;         /* allocate-once TX slot pool */
 }
 
 void trx_free(void)

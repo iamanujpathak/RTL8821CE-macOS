@@ -246,15 +246,14 @@ void rtw_kctl_connect(const struct rtw_connect_req *req, struct rtw_connect_resu
     };
     memset(out, 0, sizeof(*out));
 
-    /* CRITICAL (no-IOMMU): tear down any data path / scan rings from a PREVIOUS
-     * connection BEFORE re-running power-on + trx_init. The GUI/auto-connect can
-     * issue a connect while already connected (e.g. switching 5GHz->2.4GHz); without
-     * this, trx_init reallocates the DMA rings and the power-on sequence resets the
-     * MAC while the old RX thread + hardware DMA are still live -> the chip latches a
-     * half-programmed ring base and bus-masters to a garbage physical address ->
-     * RAM corruption -> system freeze. hw_data_stop() joins the old RX thread;
-     * trx_free() then halts DMA + disables bus-mastering before we free/realloc. Both
-     * are safe no-ops if nothing is running. */
+    /* CRITICAL (no-IOMMU): tear down any data path / scan from a PREVIOUS connection
+     * BEFORE re-running power-on. The GUI/auto-connect can issue a connect while already
+     * connected (e.g. switching 5GHz->2.4GHz). The DMA rings are allocate-once and are
+     * NOT reallocated here (trx_init early-returns and just reprograms the ring
+     * registers) — the hazard is the LIVE old RX thread + in-flight DMA when the
+     * power-on sequence resets the MAC underneath them. hw_data_stop() joins the old RX
+     * thread; trx_free() then halts TRX DMA + disables bus-mastering (it never frees the
+     * buffers). Both are safe no-ops if nothing is running. */
     hw_data_stop();
     trx_free();
     g_scan_active   = 0;
@@ -263,13 +262,23 @@ void rtw_kctl_connect(const struct rtw_connect_req *req, struct rtw_connect_resu
     struct rtw_dev d;
     kdev_init(&d);
     hw_power(1, 1);   /* re-enable PCI mem + bus-mastering (the teardown above turned it off) */
-    rtw_mac_power_on(&d);
+
+    /* Bring-up, stage by stage. A failed stage leaves the chip half-programmed with
+     * bus-mastering on, so abort — and trx_free() to halt DMA + drop bus-mastering —
+     * rather than scan/associate against an undefined device. out->status stays 0. */
+    int pr = rtw_mac_power_on(&d);
     hw_set_mac_power(1);
-    trx_init(&d);
-    download_firmware(&d, rtw8821c_fw_data, rtw8821c_fw_data_len);
-    mac_init(&d);
-    efuse_read(&d);
-    phy_set_param(&d);
+    int tr = (pr == 0) ? trx_init(&d) : -1;
+    int fr = (tr == 0) ? download_firmware(&d, rtw8821c_fw_data, rtw8821c_fw_data_len) : -1;
+    int mr = (fr == 0) ? mac_init(&d) : -1;
+    int er = (mr == 0) ? efuse_read(&d) : -1;
+    int pe = (er == 0) ? phy_set_param(&d) : -1;
+    if (pr || tr || fr || mr || er || pe) {
+        IOLog("RTW88 kctl: connect bring-up FAILED (pwr=%d trx=%d fw=%d mac=%d efuse=%d phy=%d) — aborting\n",
+              pr, tr, fr, mr, er, pe);
+        trx_free();
+        return;   /* out->status stays 0 (found=0) */
+    }
     fw_handshake(&d);
     /* hal.rfe_btg is derived from efuse.rfe_option in efuse_read() above — it
      * selects the 2.4GHz RF front-end (BTG vs WLG). Do NOT clobber it here. */
