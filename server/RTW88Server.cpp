@@ -263,12 +263,6 @@ bool RTW88Ethernet::start(IOService *provider)
 
 void RTW88Ethernet::free()
 {
-    /* Backstop for stopData()'s pathological-hang path: by the time free() runs the rx
-     * thread has exited (it dropped, in the trampoline, the reference that kept this
-     * object alive), so it is now safe to reclaim anything stopData() deferred. Both
-     * are idempotent — on the normal path stopData() already did them. */
-    if (fRxThread != THREAD_NULL) { thread_deallocate(fRxThread); fRxThread = THREAD_NULL; }
-    reorderFreeAll();
     if (fTxLock) { IOLockFree(fTxLock); fTxLock = nullptr; }
     IOEthernetController::free();
 }
@@ -762,7 +756,6 @@ void RTW88Ethernet::txEthFrame(const uint8_t *eth, uint32_t ethlen)
      * has two producers (this output thread + the rxLoop's ADDBA responder), so
      * the slot-reserve..doorbell sequence must be serialized with fTxLock. */
     IOLockLock(fTxLock);
-    if (!fDataMode) { IOLockUnlock(fTxLock); return; }   /* disconnect raced the output queue */
     uint32_t slot = fBeWp;
     uint32_t next = (slot + 1) % fBeLen;
     uint32_t hwrd = ((mmioR32(RTK_PCI_TXBD_IDX_BEQ_K) >> 16) & 0xfff) % fBeLen;
@@ -1241,7 +1234,6 @@ void RTW88Ethernet::rxLoop()
         if (depth > gDrxMaxDepth) gDrxMaxDepth = depth;
         if (depth >= fRxN - 2) gRxRingFull++;   /* HW has lapped us -> frames overwritten */
         bool got = false;
-        uint32_t drained = 0;
         while (fRxRp != hw && !fRxStop) {
             uint8_t *buf = fRxData + (uint64_t)fRxRp * fRxBufSz;
             uint32_t w0 = *(volatile uint32_t *)buf;
@@ -1260,14 +1252,8 @@ void RTW88Ethernet::rxLoop()
             }
             fRxRp = (fRxRp + 1) % fRxN;
             got = true;
-            /* Hand freed slots back to the chip mid-drain (every 16), not only once the
-             * whole drain finishes — a sustained downlink burst could otherwise lap the
-             * (64-slot, or fallback-smaller) ring while we're still draining it, silently
-             * overwriting frames the chip's write index then masks as zero occupancy. */
-            if ((++drained & 0xf) == 0)
-                mmioW16(RTK_PCI_RXBD_IDX_MPDUQ_K, (uint16_t)(fRxRp & 0xfff));
         }
-        if (got) mmioW16(RTK_PCI_RXBD_IDX_MPDUQ_K, (uint16_t)(fRxRp & 0xfff));   /* release remainder */
+        if (got) mmioW16(RTK_PCI_RXBD_IDX_MPDUQ_K, (uint16_t)(fRxRp & 0xfff));   /* release */
         /* release any reorder-buffered frames whose missing predecessor has timed out (100ms),
          * every pass incl. idle, so a never-retransmitted hole can't stall the flow. */
         reorderTimeoutAll();
@@ -1344,7 +1330,6 @@ void RTW88Ethernet::rxThreadTrampoline(void *arg, wait_result_t)
 {
     RTW88Ethernet *me = (RTW88Ethernet *)arg;
     me->rxLoop();
-    me->release();   /* drop the startData retain; `me` may be freed now — do not touch it */
     thread_terminate(current_thread());
 }
 
@@ -1393,13 +1378,7 @@ bool RTW88Ethernet::startData(RTW88Server *server, const struct rtw_data_cfg *cf
     fPendingFlush = false;
 
     fRxStop = false; fRxDone = false;
-    /* The rx thread dereferences `this` every pass (fMmio, fBa[], fTxLock via the ADDBA
-     * responder). Hold a reference for the thread's whole lifetime so dataStop()'s
-     * release() can never free the object out from under a still-live thread — even on
-     * the pathological-hang path. The trampoline drops this reference as it exits. */
-    this->retain();
     if (kernel_thread_start(&RTW88Ethernet::rxThreadTrampoline, this, &fRxThread) != KERN_SUCCESS) {
-        this->release();
         fDataMode = false;
         return false;
     }
@@ -1411,31 +1390,24 @@ bool RTW88Ethernet::startData(RTW88Server *server, const struct rtw_data_cfg *cf
 void RTW88Ethernet::stopData()
 {
     if (!fDataMode) return;
-
-    /* Close the TX path first. fDataMode is the gate txEthFrame re-checks under fTxLock,
-     * so clearing it under the same lock guarantees no output-queue producer is mid-build
-     * when we tear down. fTxPoolV is deliberately left valid: the pool is borrowed from
-     * the allocate-once trx pool and never freed, so a late TX DMA read can only ever
-     * land in still-wired memory (and a racing producer can't deref a nulled pointer). */
-    IOLockLock(fTxLock);
-    fDataMode = false;
-    IOLockUnlock(fTxLock);
-
     fRxStop = true;
-    /* Wait for the rx thread to exit so teardown is deterministic. It tests fRxStop every
-     * pass and its MMIO reads never block while the MAC is powered, so this resolves
-     * within one poll iteration; keep a generous ceiling so a pathological hang can't
-     * wedge disconnect. The thread holds a reference on this object (taken in startData),
-     * so even if the ceiling expires the object can't be freed out from under it — free()
-     * performs the deferred cleanup once the thread finally drops that reference. */
+    /* Wait until the rx thread has truly exited before freeing anything it touches
+     * (the reorder windows). It tests fRxStop every pass and its MMIO reads never block
+     * while the MAC is powered, so this resolves within one poll iteration; a fixed
+     * timeout that expired while the thread was still live would be a use-after-free.
+     * Keep a generous ceiling so a pathological hang can't wedge disconnect. */
     int spins = 0;
-    while (!fRxDone && ++spins <= 2000) IOSleep(5);   /* ~10s ceiling */
-    if (fRxDone) {
+    while (!fRxDone && ++spins <= 2000) IOSleep(5);   /* ~10s hard ceiling */
+    if (!fRxDone) {
+        IOLog("RTW-data: WARNING rx thread still live after 10s — leaking reorder windows to avoid UAF\n");
+    } else {
         if (fRxThread != THREAD_NULL) { thread_deallocate(fRxThread); fRxThread = THREAD_NULL; }
         reorderFreeAll();   /* RX thread gone -> safe to free the reorder windows */
-    } else {
-        IOLog("RTW-data: WARNING rx thread still live after 10s — deferring cleanup to thread exit\n");
     }
+    fDataMode = false;
+    /* fTxPool is borrowed from the allocate-once trx pool (see startData) — never freed
+     * here, so a still-in-flight TX DMA read can't land in a recycled page. */
+    fTxPoolV = nullptr;
     IOLog("RTW-data: data path stopped\n");
 }
 

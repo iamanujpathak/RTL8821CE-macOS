@@ -74,12 +74,7 @@ typedef int32_t  s32;
 static inline void udelay(unsigned us) { IODelay(us ? us : 1); }            /* busy-wait us */
 static inline void mdelay(unsigned ms) { IOSleep(ms ? ms : 1); }           /* sleep ms (worker ctx) */
 static inline void msleep(unsigned ms) { IOSleep(ms ? ms : 1); }
-/* Sleep (yield the CPU) for millisecond-scale waits; busy-wait only sub-ms. Matches
- * usleep() above. The old unconditional IODelay() busy-spun the control thread for the
- * full request — e.g. the 5GHz IQK loops usleep_range(20000,..) x100 = ~2s of pegged,
- * unpreemptible CPU per connect. These callers run on the external-method call thread
- * (not interrupt context), so IOSleep is safe. */
-static inline void usleep_range(unsigned lo, unsigned hi) { (void)hi; if (lo >= 1000) IOSleep((lo + 999) / 1000); else IODelay(lo ? lo : 1); }
+static inline void usleep_range(unsigned lo, unsigned hi) { (void)hi; IODelay(lo ? lo : 1); }
 #else
 static inline void udelay(unsigned us) { usleep(us ? us : 1); }
 static inline void mdelay(unsigned ms) { usleep((useconds_t)ms * 1000); }
