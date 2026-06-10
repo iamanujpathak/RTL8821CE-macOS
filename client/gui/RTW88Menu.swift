@@ -320,31 +320,49 @@ final class WifiVM: ObservableObject {
 struct NetRow: View {
     let net: WifiNet
     let isCurrent: Bool
-    let onTap: () -> Void
+    let isExpanded: Bool      // password panel open below (secure + unsaved only)
+    let busy: Bool
+    let onConnect: () -> Void // saved -> connect now; secure+unsaved -> toggle password panel
+    let onForget: () -> Void
+
+    /// open + unsaved networks aren't joinable yet (CCMP-only in-kext path)
+    var joinable: Bool { net.secure || net.saved }
+
     var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 8) {
-                Image(systemName: isCurrent ? "checkmark.circle.fill" : "wifi")
-                    .foregroundColor(isCurrent ? .green : .primary)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(net.ssid).fontWeight(isCurrent ? .semibold : .regular)
-                    Text("\(net.band) GHz · ch \(net.channel)")
-                        .font(.caption2).foregroundColor(.secondary)
-                }
-                Spacer()
-                if net.saved {
-                    Image(systemName: "key.fill").font(.caption2).foregroundColor(.secondary)
-                        .help("Saved network")
-                }
-                if net.secure {
-                    Image(systemName: "lock.fill").font(.caption2).foregroundColor(.secondary)
-                        .help("Password protected")
-                }
-                signalBars
+        HStack(spacing: 8) {
+            Image(systemName: isCurrent ? "checkmark.circle.fill" : "wifi")
+                .foregroundColor(isCurrent ? .green : .primary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(net.ssid).fontWeight(isCurrent ? .semibold : .regular)
+                Text("\(net.band) GHz · ch \(net.channel)")
+                    .font(.caption2).foregroundColor(.secondary)
             }
-            .contentShape(Rectangle())
+            Spacer()
+            if net.secure {
+                Image(systemName: "lock.fill").font(.caption2).foregroundColor(.secondary)
+                    .help("Password protected")
+            }
+            signalBars
+            if !isCurrent {
+                if net.saved {
+                    // bin icon = forget (replaces the old "Forget" button / context menu)
+                    Button { onForget() } label: { Image(systemName: "trash") }
+                        .buttonStyle(.borderless).controlSize(.small)
+                        .foregroundColor(.secondary).help("Forget this network")
+                }
+                if joinable {
+                    // inline Connect on the row itself. For a secure+unsaved network this
+                    // opens the password panel below; otherwise it connects immediately.
+                    Button(isExpanded ? "Cancel" : "Connect") { onConnect() }
+                        .controlSize(.small).disabled(busy)
+                } else {
+                    Text("WPA2 only").font(.caption2).foregroundColor(.secondary)
+                        .help("Open networks aren't supported yet")
+                }
+            }
         }
-        .buttonStyle(.plain)
+        .padding(.vertical, 1)
+        .contentShape(Rectangle())
     }
     var signalBars: some View {
         HStack(spacing: 1) {
@@ -357,67 +375,42 @@ struct NetRow: View {
     }
 }
 
-/// expansion panel under a selected row: password (with show/hide eye) +
-/// remember checkbox + Connect, or Connect/Forget for saved networks.
-struct JoinPanel: View {
-    let net: WifiNet
+/// password entry shown below a secure, unsaved row when its Connect is pressed:
+/// field + show/hide eye + remember + Join.
+struct PasswordPanel: View {
     @Binding var password: String
     @Binding var showPassword: Bool
     @Binding var remember: Bool
     let error: String?
-    let onConnect: () -> Void
-    let onForget: () -> Void
-
-    var needsPassword: Bool { net.secure && !net.saved }
+    let onJoin: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if !net.secure {
-                // The in-kext data path is CCMP-only, so an open-network join never
-                // starts the data path (see KNOWN_ISSUES). Say so instead of offering a
-                // Connect button that always fails.
-                Label("Open networks aren't supported yet (WPA2 only).",
-                      systemImage: "exclamationmark.triangle")
-                    .font(.caption).foregroundColor(.secondary)
-            } else {
-            if needsPassword {
-                HStack(spacing: 6) {
-                    Group {
-                        if showPassword {
-                            TextField("Password", text: $password)
-                        } else {
-                            SecureField("Password", text: $password)
-                        }
-                    }
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { onConnect() }
-                    Button {
-                        showPassword.toggle()
-                    } label: {
-                        Image(systemName: showPassword ? "eye.slash" : "eye")
-                    }
-                    .buttonStyle(.plain)
-                    .help(showPassword ? "Hide password" : "Show password")
+            HStack(spacing: 6) {
+                Group {
+                    if showPassword { TextField("Password", text: $password) }
+                    else            { SecureField("Password", text: $password) }
                 }
-                Toggle("Remember this network", isOn: $remember)
-                    .font(.caption)
-                    .toggleStyle(.checkbox)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { onJoin() }
+                Button { showPassword.toggle() } label: {
+                    Image(systemName: showPassword ? "eye.slash" : "eye")
+                }
+                .buttonStyle(.plain)
+                .help(showPassword ? "Hide password" : "Show password")
             }
-            HStack(spacing: 8) {
-                Button("Connect") { onConnect() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(needsPassword && password.isEmpty)
-                if net.saved {
-                    Button("Forget") { onForget() }
-                }
+            HStack {
+                Toggle("Remember this network", isOn: $remember)
+                    .font(.caption).toggleStyle(.checkbox)
                 Spacer()
+                Button("Join") { onJoin() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(password.isEmpty)
             }
             if let error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption2).foregroundColor(.orange)
-                    .lineLimit(2)
+                    .font(.caption2).foregroundColor(.orange).lineLimit(2)
             }
-            }   // end: secure
         }
         .padding(.vertical, 4).padding(.leading, 24)
     }
@@ -471,28 +464,31 @@ struct ContentView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
                         ForEach(vm.nets) { net in
-                            NetRow(net: net, isCurrent: net.ssid == vm.connectedSSID) {
-                                if net.ssid == vm.connectedSSID { return }
-                                if selected?.id == net.id {
-                                    selected = nil          // collapse on second click
-                                } else {
-                                    selected = net; password = ""; showPassword = false
-                                    remember = true; vm.lastError = nil
-                                }
-                            }
-                            .contextMenu {
-                                if net.saved {
-                                    Button("Forget Network") { vm.forget(net.ssid) }
-                                }
-                            }
-                            if selected?.id == net.id && net.ssid != vm.connectedSSID {
-                                JoinPanel(net: net,
-                                          password: $password,
-                                          showPassword: $showPassword,
-                                          remember: $remember,
-                                          error: vm.lastError,
-                                          onConnect: { connectSelected(net) },
-                                          onForget: { vm.forget(net.ssid); selected = nil })
+                            let expanded = selected?.id == net.id
+                            NetRow(net: net,
+                                   isCurrent: net.ssid == vm.connectedSSID,
+                                   isExpanded: expanded,
+                                   busy: vm.busy,
+                                   onConnect: {
+                                       if net.ssid == vm.connectedSSID { return }
+                                       if net.secure && !net.saved {
+                                           // toggle the inline password panel
+                                           if expanded { selected = nil }
+                                           else { selected = net; password = ""; showPassword = false
+                                                  remember = true; vm.lastError = nil }
+                                       } else {
+                                           // saved (secure) -> connect with the saved password now
+                                           selected = nil
+                                           vm.connect(net.ssid, "")
+                                       }
+                                   },
+                                   onForget: { vm.forget(net.ssid); if expanded { selected = nil } })
+                            if expanded && net.secure && !net.saved && net.ssid != vm.connectedSSID {
+                                PasswordPanel(password: $password,
+                                              showPassword: $showPassword,
+                                              remember: $remember,
+                                              error: vm.lastError,
+                                              onJoin: { vm.connect(net.ssid, password, remember: remember) })
                             }
                         }
                         if vm.nets.isEmpty && !vm.busy {
@@ -517,12 +513,6 @@ struct ContentView: View {
         .frame(width: 320)
         // no auto-scan on open — the Scan button (top-right) triggers it.
         .onAppear { vm.refreshStatus() }
-    }
-
-    func connectSelected(_ net: WifiNet) {
-        vm.connect(net.ssid, password, remember: remember)
-        // keep `selected` + password: if the join fails, the error appears inline
-        // and the user can correct the password instead of retyping it.
     }
 }
 
