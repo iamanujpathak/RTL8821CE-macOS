@@ -399,7 +399,12 @@ int trx_tx_h2c(struct rtw_dev *rtwdev, const u8 *pkt)
 
     u32 *w = (u32 *)g_pkt_vaddr;
     w[0] = le32_encode_bits(len, RTW_TX_DESC_W0_TXPKTSIZE) |
-           le32_encode_bits(desc_sz, RTW_TX_DESC_W0_OFFSET);
+           le32_encode_bits(desc_sz, RTW_TX_DESC_W0_OFFSET) |
+           le32_encode_bits(1, RTW_TX_DESC_W0_LS);   /* Last Segment: without it the MAC never
+                                                      * completes the packet to the MCU, so every
+                                                      * H2C (general_info/phydm_info/IQK) is dropped.
+                                                      * Both working paths (mgmt + fw-download) and
+                                                      * upstream rtw_tx_fill_tx_desc set LS=1. */
     w[1] = le32_encode_bits(TX_DESC_QSEL_H2C, RTW_TX_DESC_W1_QSEL);
 
     struct tx_ring *ring = &g_tx[RTW_TX_QUEUE_H2C];

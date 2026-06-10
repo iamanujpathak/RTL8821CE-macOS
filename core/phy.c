@@ -59,44 +59,48 @@ bool rtw_write_rf(struct rtw_dev *rtwdev, enum rtw_rf_path rf_path, u32 addr, u3
 /* ---- IQK (firmware I/Q calibration) — rtw8821c_do_iqk -------------------- *
  * 8821c calibration is a single firmware H2C (no driver-side DPK/LCK/DACK): send the
  * IQK packet, then poll RF path-A reg 0x08 (RF_DTXLOK) for the firmware's 0xABCDE
- * "done" sentinel and clear it. Without it, TX/RX I/Q imbalance leaves an image that
- * corrupts a large fraction of received symbols -> many silent FCS failures (frames
- * absent from the ring, err=0) -> the AP rate-floors + the downlink collapses. Run on
- * the connection channel after it's tuned. */
+ * "done" sentinel and clear it. When it runs it removes the TX/RX I/Q image that
+ * otherwise corrupts a fraction of received symbols (silent FCS failures, err=0, after
+ * which the AP rate-floors the downlink). Run on the connection channel once it's tuned.
+ *
+ * KNOWN LIMITATION (see KNOWN_ISSUES.md): on this port the firmware does NOT execute the
+ * IQK. It receives a byte-perfect IQK H2C — verified on hardware against upstream rtw88:
+ * identical packet format, identical H2C-ring delivery, firmware v24.11 which supports
+ * IQK — yet never writes the 0xABCDE sentinel (RF 0x08 stays at its 0x9c060 reset value).
+ * Every driver-side cause was eliminated step by step (completion mechanism, packet
+ * format, H2C Last-Segment bit, the RFK-inform wrap, the poll window, the RF read path).
+ * The remaining gap is a firmware bring-up precondition upstream establishes that this
+ * port does not. RX therefore runs UNCALIBRATED — tolerable at 20MHz HT (the link works,
+ * ~40 Mbps) but the suspected blocker for 40MHz. The code below matches upstream
+ * rtw8821c_do_iqk, so it will work once the precondition is found (capture a live rtw88
+ * H2C/register trace around phy_calibration on this hardware and diff). Non-fatal. */
 extern int trx_tx_h2c(struct rtw_dev *rtwdev, const u8 *pkt);
-
-/* tell the MCU RF-calibration is starting/stopping (rtw_fw_inform_rfk_status) via the
- * 8-byte mailbox: H2C_CMD_WIFI_CALIBRATION=0x6d, RFK_SET_INFORM_START=BIT(8). The firmware
- * needs this to actually run IQK — without it the IQK packet was ignored (the TIMEOUT). */
-static void iqk_inform_rfk(struct rtw_dev *rtwdev, int start)
-{
-    for (int i = 0; i < 100; i++) { if (!(hw_read8(REG_HMETFR) & BIT(0))) break; usleep_range(1000, 1000); }
-    hw_write32(REG_HMEBOX0_EX, 0);
-    hw_write32(REG_HMEBOX0, start ? 0x0000016d : 0x0000006d);   /* 0x6d | (start?BIT(8):0) */
-    usleep_range(2000, 2000);
-}
 
 void rtw_do_iqk(struct rtw_dev *rtwdev)
 {
+    /* IQK H2C packet, matching upstream rtw_fw_do_iqk: word0 = category 0x01 |
+     * cmd 0xFF | sub_id IQK(0x0E); word1 = total_len(HDR 8 + 1) | seq; word2 =
+     * clear(bit0)=0 + segment_iqk(bit1)=0 (full IQK — correct pre-association).
+     * Upstream issues no RFK-inform mailbox around this, so neither do we. */
     static u16 seq = 2;                 /* fw_handshake used seq 0,1 at bring-up */
-    iqk_inform_rfk(rtwdev, 1);          /* RFK start — required or the fw ignores IQK */
-
     u8 pkt[32] = {0};
     u32 *w = (u32 *)pkt;
-    w[0] = 0x01u | (0xFFu << 8) | (0x0Eu << 16);   /* category 0x01 | cmd 0xFF | sub_id IQK(0x0E) */
-    w[1] = 9u | ((u32)seq++ << 16);                /* total_len = HDR(8)+1, seq */
-    w[2] = 0;                                       /* clear=0 (bit0), segment_iqk=0 (bit1): full IQK */
+    w[0] = 0x01u | (0xFFu << 8) | (0x0Eu << 16);
+    w[1] = 9u | ((u32)seq++ << 16);
+    w[2] = 0;
     trx_tx_h2c(rtwdev, pkt);
 
-    int done = 0;
-    for (int i = 0; i < 100; i++) {                /* cap ~2s; proceed regardless */
-        u32 rf = rtw_phy_read_rf(rtwdev, RF_PATH_A, 0x08, RFREG_MASK);
-        if (rf == 0xabcde) { done = 1; break; }
+    int done = 0, i;
+    for (i = 0; i < 300; i++) {          /* ~6s, matching upstream rtw8821c_do_iqk's 300 x 20ms */
+        if (rtw_phy_read_rf(rtwdev, RF_PATH_A, 0x08, RFREG_MASK) == 0xabcde) { done = 1; break; }
         usleep_range(20000, 20000);
     }
     rtw_write_rf(rtwdev, RF_PATH_A, 0x08, RFREG_MASK, 0x0);
-    iqk_inform_rfk(rtwdev, 0);          /* RFK stop */
-    rtw_info(rtwdev, "  IQK %s", done ? "done (fw 0xABCDE)" : "TIMEOUT (uncalibrated)");
+    /* REG_IQKFAILMSK (0x1bf0) [7:0] = per-path fail mask. On a timeout, failmask==0 means
+     * the firmware never ran the calibration (the known limitation documented above). */
+    rtw_info(rtwdev, "  IQK %s (failmask=0x%02x)",
+             done ? "done — calibrated" : "TIMEOUT — fw did not run IQK (uncalibrated)",
+             hw_read32(0x1bf0) & 0xffu);
 }
 
 /* ---- cfg appliers (phy.c, verbatim) ------------------------------------- */
