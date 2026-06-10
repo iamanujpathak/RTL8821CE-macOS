@@ -20,6 +20,7 @@
 struct wifi_session g_session = { 0, 0, RTW_RATEID_G, DESC_RATE54M };
 
 void set_channel(struct rtw_dev *rtwdev, u8 channel, u8 bw, u8 primary_ch_idx);
+void rtw_do_iqk(struct rtw_dev *rtwdev);   /* phy.c — firmware I/Q calibration */
 int  wpa_handshake(struct rtw_dev *rtwdev, const u8 *bssid,
                          const char *ssid, const char *pass, u8 channel);
 
@@ -51,7 +52,15 @@ static u32 build_auth_req(u8 *buf, const u8 *sa, const u8 *bssid)
  * rate-floors us to VHT-MCS0 + retransmits (the retry storm). Drop the VHT IE so
  * the AP is forced to 20 MHz HT frames we fully receive. Flip back to 1 ONLY once
  * the 80 MHz baseband path is ported. */
-#define RTW_ADVERTISE_VHT 1
+/* 0 = don't advertise VHT. With the ASPM/SIG-B fix RX now flows, and the health log
+ * shows ~36% of the AP's SNs simply never arrive (err=0, ringFull=0) — the signature of
+ * the AP sending 40/80MHz VHT PPDUs our 20MHz-only baseband can't demodulate. Advertising
+ * VHT implies >=80MHz; dropping it (HT cap is 20MHz-only) forces the AP to 20MHz HT we can
+ * fully receive. NOTE: this is the BINDING downlink ceiling — HT-MCS7 @20MHz 1SS +SGI =
+ * 72.2 Mbps PHY (~55-65 Mbps TCP), so a >~70 Mbps WAN cannot be saturated until the
+ * 40/80MHz baseband path lands (the 8821CE is 1x1, so 2 spatial streams aren't an option).
+ * Flip back to 1 only once the 40/80MHz baseband path (set_channel_bb) is ported. */
+#define RTW_ADVERTISE_VHT 0
 
 static u32 build_assoc_req(u8 *buf, const u8 *sa, const u8 *bssid,
                            const char *ssid, u8 ssid_len, int five_ghz)
@@ -91,7 +100,9 @@ static u32 build_assoc_req(u8 *buf, const u8 *sa, const u8 *bssid,
     buf[n++] = 45; buf[n++] = 26;
     buf[n++] = 0x20; buf[n++] = 0x08;   /* HT cap info: SGI-20 | Max-A-MSDU (the kext  */
                                         /* now de-aggregates A-MSDU, so invite it)     */
-    buf[n++] = 0x0b;                    /* A-MPDU params: 64K factor, density 2    */
+    buf[n++] = 0x1b;                    /* A-MPDU params: 64K factor (3), density 6 (8us). Was
+                                        * density 2 (0.5us) — too tight if our HW drops closely
+                                        * spaced subframes; loosen so the AP spaces them out.  */
     buf[n++] = 0xff;                    /* Supported MCS set: RX MCS0-7 (1SS)      */
     for (int i = 0; i < 15; i++) buf[n++] = 0x00;  /* rest of 16B MCS set          */
     buf[n++] = 0x00; buf[n++] = 0x00;   /* HT extended capabilities                */
@@ -206,6 +217,11 @@ int associate(struct rtw_dev *rtwdev, const u8 *bssid,
     printf("\n=== associate to \"%s\" %02x:%02x:%02x:%02x:%02x:%02x ch %u ===\n",
            ssid, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel);
     set_channel(rtwdev, channel, RTW_CHANNEL_WIDTH_20, 0);
+
+    /* IQK on the tuned channel before auth: uncalibrated I/Q imbalance silently drops a
+     * large fraction of RX frames. 5GHz-only for now (the firmware IQK coincided with a
+     * 2.4GHz hard-freeze previously; the user runs 5GHz). Non-fatal on timeout. */
+    if (five) rtw_do_iqk(rtwdev);
 
     /* AUTH (open system) */
     int auth_ok = 0;

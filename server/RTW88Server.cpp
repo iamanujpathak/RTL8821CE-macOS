@@ -50,6 +50,7 @@ extern "C" void rtw_kctl_connect(const struct rtw_connect_req *req, struct rtw_c
 extern "C" void rtw_kctl_disconnect(void);   /* tear down enX + rings */
 extern "C" void rtw_kctl_status(struct rtw_status_result *out);   /* live connection state */
 extern "C" void rtw_kctl_scan_chunk(const struct rtw_scan_chans *in, struct rtw_scan_result *out);   /* streamed chunked scan */
+extern "C" void trx_free(void);   /* halt TRX DMA + disable bus-mastering (no buffer free — allocate-once) */
 
 /* The active device, for the C control code's DMA/PCI shim (extern "C" wrappers at
  * end of file). Set in RTW88Server::start(). */
@@ -66,6 +67,34 @@ static RTW88Server *g_dev = nullptr;
  * inputPacket()s — no per-packet syscalls. The interface MAC is the card's real
  * MAC so the AP addressing stays consistent.
  */
+/*
+ * Per-TID A-MPDU RX reorder buffer (mac80211 tid_ampdu_rx port). Now that the ASPM
+ * fix lets VHT A-MPDU actually flow, retransmitted sub-frames arrive out of order;
+ * delivering them straight to TCP collapses the window. One window per TID, created
+ * from the AP's ADDBA (SSN + buffer size), released in order with a 100ms hole
+ * timeout. Single-threaded on rxLoop, no locks. Slot index uses %64 (divides the
+ * 4096 SN space) so it never collides at the 12-bit wrap.
+ */
+#define RTW_BA_TID_NUM         8
+#define RTW_BA_WIN_MAX         64
+#define RTW_REORDER_SLOT_SZ    12288               /* >= VHT MAX_MPDU (11454) + headers */
+#define RTW_REORDER_TIMEOUT_NS (100ull * 1000 * 1000)
+#define RTW_REORDER_IDX(sn)    ((uint32_t)((sn) & (RTW_BA_WIN_MAX - 1)))
+
+struct ReorderTid {
+    bool      active, started;
+    uint16_t  head, win;
+    uint32_t  stored;
+    uint8_t  *store;
+    uint32_t  len[RTW_BA_WIN_MAX];
+    uint64_t  t_ns[RTW_BA_WIN_MAX];
+    bool      occ[RTW_BA_WIN_MAX];
+};
+static inline bool     rtw_sn_less(uint16_t a, uint16_t b) { return ((uint16_t)(a - b) & 0xfff) > 0x800; }
+static inline uint16_t rtw_sn_inc(uint16_t a)              { return (uint16_t)((a + 1) & 0xfff); }
+static inline uint16_t rtw_sn_sub(uint16_t a, uint16_t b)  { return (uint16_t)((a - b) & 0xfff); }
+static inline uint64_t rtw_uptime_ns(void) { uint64_t a, ns; clock_get_uptime(&a); absolutetime_to_nanoseconds(a, &ns); return ns; }
+
 class RTW88Ethernet : public IOEthernetController {
     OSDeclareDefaultStructors(RTW88Ethernet)
 public:
@@ -94,10 +123,10 @@ private:
     IOEthernetAddress    fMac;
     IOLock              *fTxLock   = nullptr;
     IONetworkMedium     *fMedium   = nullptr;
-    bool                 fRunning  = false;
+    volatile bool        fRunning  = false;
 
     /* in-kext data path state */
-    bool                 fDataMode = false;
+    volatile bool        fDataMode = false;
     volatile uint8_t    *fMmio     = nullptr;   /* BAR2 base (from the server)   */
     uint8_t              fBssid[6] = {0};
     uint8_t              fRate     = 0;
@@ -106,7 +135,8 @@ private:
     uint32_t             fBeLen=0, fBdSz=0, fDescSz=0, fBeWp=0;
     uint8_t             *fRxData   = nullptr;    /* RX data pool (kernel vaddr)   */
     uint32_t             fRxN=0, fRxBufSz=0, fRxDescSz=0, fRxRp=0;
-    IOBufferMemoryDescriptor *fTxPool = nullptr; /* our per-slot TX buffer pool   */
+    /* per-slot TX buffer pool: borrowed by handle from the allocate-once trx pool
+     * (NOT owned here) — so it is never freed across connect/disconnect churn. */
     uint8_t             *fTxPoolV  = nullptr;
     uint64_t             fTxPoolPa = 0;
     uint32_t             fTxSlotSz = 0;
@@ -115,19 +145,52 @@ private:
     volatile bool        fRxStop   = false;
     volatile bool        fRxDone   = false;
 
+    /* DIG (dynamic initial gain) + health-log cadence — per-session instance state
+     * (reset in startData) so a reconnect starts from the fresh AGC default rather
+     * than a stale gain left over from a previous link. */
+    bool                 fDigInit  = false;
+    uint32_t             fDigIgi   = 0x20;
+    uint64_t             fDigLastNs = 0;
+    uint64_t             fHealthLastNs = 0;
+
+    /* per-TID A-MPDU RX reorder state (single-threaded on rxLoop) */
+    ReorderTid           fBa[RTW_BA_TID_NUM];
+    bool                 fPendingFlush = false;
+
     static void rxThreadTrampoline(void *arg, wait_result_t);
     void rxLoop();
-    void rxFrame(const uint8_t *f, uint32_t pkt_len);
+    void rxFrame(const uint8_t *f, uint32_t pkt_len);       /* dispatch -> reorder or deliver */
+    void deliverMpdu(const uint8_t *f, uint32_t pkt_len);   /* parse one data MPDU -> eth -> stack */
     void txEthFrame(const uint8_t *eth, uint32_t ethlen);
     void txAction(const uint8_t *frame, uint32_t flen);   /* unencrypted fixed-rate mgmt TX */
     void handleAddbaReq(const uint8_t *f, uint32_t len);   /* answer the AP's Block-Ack setup */
+    void handleDelba(const uint8_t *f, uint32_t len);      /* AP tears a Block-Ack session down */
     void inputEth(const uint8_t *data, uint32_t len);
+    /* reorder engine */
+    void     reorderActivate(uint8_t tid, uint16_t ssn, uint16_t win);
+    void     reorderDeactivate(uint8_t tid);
+    void     reorderFreeAll();
+    void     reorderInsert(uint8_t tid, uint16_t sn, const uint8_t *f, uint32_t len);
+    void     deliverSlot(ReorderTid *rt, uint32_t idx);
+    uint32_t reorderDrainReady(ReorderTid *rt);
+    uint32_t reorderTimeoutAll();
     inline uint32_t mmioR32(uint32_t off) { return *(volatile uint32_t *)(fMmio + off); }
     inline void     mmioW16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(fMmio + off) = v; }
+    inline void     mmioW32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fMmio + off) = v; }
 };
 
 #define RTK_PCI_TXBD_IDX_BEQ_K    0x3A8
 #define RTK_PCI_RXBD_IDX_MPDUQ_K  0x3B4
+
+/* TX descriptor bit fields for the in-kext builders. These MUST match the named
+ * RTW_TX_DESC_W* macros in core/trx_regs.h (the kext can't include that header). */
+#define KTX_W0_OFFSET_SHIFT  16          /* W0 OFFSET   GENMASK(23,16) */
+#define KTX_W0_LS            (1u << 26)  /* W0 LS       BIT(26)        */
+#define KTX_W1_RATEID_SHIFT  16          /* W1 RATE_ID  GENMASK(20,16) */
+#define KTX_W1_SECTYPE_SHIFT 22          /* W1 SEC_TYPE GENMASK(23,22) */
+#define KTX_W3_USE_RATE     (1u << 8)    /* W3 USE_RATE BIT(8)         */
+#define KTX_W3_DISDATAFB    (1u << 10)   /* W3 DISDATAFB BIT(10)       */
+#define KTX_W8_EN_HWSEQ     (1u << 31)   /* W8 EN_HWSEQ BIT(31)        */
 
 /* data-path diagnostics (in-memory only — read+reset via kBridgeDataStats; NO
  * disk/log writes). rxMaxDepth = peak RX-ring occupancy: if it pins near the
@@ -150,6 +213,20 @@ static volatile uint16_t gLastSeq = 0xffff;
  * gRetryDup: retry-bit frames whose per-TID seq is a dup/old one (AP resend we DID get).
  * gTidMask: bitmask of TIDs seen (popcount rules the multi-TID question in/out). */
 static volatile uint64_t gMiss, gRxRingFull, gRateSum, gRateN, gRateMax, gRetryDup;
+static volatile uint64_t gRateMin = 0xff;   /* lowest RX PHY-rate code — detects MCS0/CCK flooring */
+/* parse-drop breakdown (which path drops the ~14% gDrxParse): */
+static volatile uint64_t gPShort, gPLlc, gPAmsdu, gPBig, gPHtcFix;   /* gPHtcFix = recovered via +/-HTC retry */
+/* reorder activity for the health log: */
+static volatile uint64_t gReordBuf, gReordTo, gReordRel;   /* gReordRel = frames released in order */
+/* stale = AP resent a frame we already delivered (sn < head); dup = resent into an
+ * occupied slot. HIGH stale/dup => AP retransmitting things we HAVE (Block-Ack/TX issue);
+ * LOW stale/dup + HIGH timeout => frames genuinely never arrive (RX sensitivity). */
+static volatile uint64_t gReordStale, gReordDup;
+/* DIG (dynamic initial gain) state for the health log: gDigFa = OFDM false-alarm count
+ * per interval (high => RX gain too sensitive: saturation/noise eats frames at close range),
+ * gDigIgi = current initial gain (REG 0xc50[6:0]). */
+static volatile uint64_t gDigFa; static volatile uint32_t gDigIgi;
+static volatile uint32_t gReordActiveMask;
 static volatile uint64_t gBigJump;   /* per-TID seq jumps > a BA window: AP serving others / idle gap, NOT our loss */
 static volatile uint32_t gTidMask;
 static uint16_t gLastSeqTid[8] = {0xffff,0xffff,0xffff,0xffff,0xffff,0xffff,0xffff,0xffff};
@@ -268,6 +345,7 @@ public:
     IOReturn irqStatus(uint32_t off, uint32_t width, uint64_t *out);
     void     setMacPower(bool on);
     IOReturn power(bool memEnable, bool busMaster);
+    void     disableAspm();   /* kill PCIe ASPM L1 — 8821CE stalls RX DMA in L1 while polling */
 
     /* --- in-kext data path (publishes enX, runs TX/RX in-kernel) --- */
     IOReturn dataStart(const struct rtw_data_cfg *cfg);
@@ -328,6 +406,10 @@ bool RTW88Server::start(IOService *provider)
 
     fPci->setMemoryEnable(true);
     fPci->setBusLeadEnable(true);
+    disableAspm();   /* before any DMA: the 8821CE only exits ASPM L1 on an IRQ, and our
+                      * data path polls with the RX IRQ masked, so in L1 the device-initiated
+                      * RX DMA stalls (downlink dies, ~328ms latency) while host-initiated TX
+                      * keeps the link awake (uplink fine). Documented 8821CE quirk. */
 
     fBarMap = fPci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + RTL_BAR_INDEX * 4);
     if (!fBarMap) { IOLog("RTW-bridge: BAR%d map failed\n", RTL_BAR_INDEX); return false; }
@@ -358,6 +440,13 @@ bool RTW88Server::start(IOService *provider)
 void RTW88Server::stop(IOService *provider)
 {
     dataStop();   /* stops the RX thread + tears down enX */
+    /* Quiesce the chip BEFORE releasing the DMA buffers. On a forced unload / provider
+     * termination that didn't run a clean disconnect, the device may still be armed and
+     * bus-mastering; freeing a buffer it can still DMA into is the no-IOMMU corruption
+     * class (reused page stomped by in-flight DMA). trx_free() halts TRX DMA, drops the
+     * ring-base registers, disables bus-mastering and drains in-flight DMA — making the
+     * release loop below safe. (No-op-safe if a clean disconnect already ran it.) */
+    if (fMmio) trx_free();
     irqDisable();
     if (fWorkLoop) { fWorkLoop->release(); fWorkLoop = nullptr; }
     for (int i = 0; i < RTW_BRIDGE_MAX_DMA; i++) {
@@ -442,7 +531,15 @@ IOReturn RTW88Server::dmaAlloc(uint64_t size, uint64_t *handle, uint64_t *paddr)
         if (bmd->prepare() != kIOReturnSuccess) { bmd->release(); break; }
         IOByteCount seglen = 0;
         IOPhysicalAddress pa = bmd->getPhysicalSegment(0, &seglen, kIOMemoryMapperNone);
-        if (!pa) { bmd->complete(); bmd->release(); break; }
+        /* No IOMMU: the device is handed this base + per-BD offsets, so the whole buffer
+         * MUST be one physically contiguous run. inTaskWithPhysicalMask(...Contiguous)
+         * guarantees it, but enforce rather than assume — a short segment 0 would point
+         * later BDs at stray physical pages. */
+        if (!pa || seglen < size) {
+            if (!pa) IOLog("RTW-bridge: DMA alloc got null paddr\n");
+            else     IOLog("RTW-bridge: DMA alloc not contiguous (seg0 %llu < %llu)\n", (uint64_t)seglen, size);
+            bmd->complete(); bmd->release(); break;
+        }
         bzero((void *)bmd->getBytesNoCopy(), size);
         fDma[i].bmd = bmd; fDma[i].paddr = pa; fDma[i].size = size;
         *handle = (uint64_t)i; *paddr = pa;
@@ -524,6 +621,32 @@ IOReturn RTW88Server::power(bool memEnable, bool busMaster)
     fPci->setBusLeadEnable(busMaster);
     IOLog("RTW-bridge: power mem=%d busmaster=%d\n", memEnable, busMaster);
     return kIOReturnSuccess;
+}
+
+/* Disable PCIe ASPM (L0s + L1) on the device.
+ *
+ * THE downlink fix. Upstream rtw88 documents that "the 8821CE only leaves ASPM L1
+ * for a short period when IRQ is raised; since IRQ is masked during NAPI polling the
+ * PCIe link stays at L1 and makes RX DMA extremely slow — eventually the RX ring
+ * becomes messed up." Our data path is a pure poll loop with the RX IRQ masked, so
+ * the link parks in L1 and the device-initiated RX DMA (downlink) stalls, while
+ * host-initiated TX (our MMIO doorbell writes) keeps the link awake (uplink fine) —
+ * exactly the measured 20x DL/UL asymmetry + 328ms latency.
+ *
+ * Clear the ASPM Control field (bits[1:0]) of the PCI Express Link Control register
+ * so the device never enters L0s/L1. (Upstream toggles per-poll; we never use the RX
+ * IRQ, so we disable it outright for the device's lifetime.) */
+void RTW88Server::disableAspm()
+{
+    if (!fPci) return;
+    uint32_t cap = fPci->findPCICapability(0x10 /* PCI Express Capability ID */) & 0xff;
+    if (!cap) { IOLog("RTW-bridge: no PCIe cap — cannot disable ASPM\n"); return; }
+    uint32_t lctl_off = cap + 0x10;             /* Link Control register */
+    uint16_t lctl = fPci->configRead16(lctl_off);
+    uint16_t neu  = lctl & ~0x0003;                        /* clear ASPM L0s|L1 enable */
+    if (neu != lctl) fPci->configWrite16(lctl_off, neu);
+    IOLog("RTW-bridge: ASPM disabled (LinkCtl@0x%x 0x%04x -> 0x%04x)\n",
+          lctl_off, lctl, fPci->configRead16(lctl_off));
 }
 
 /* IRQ-status read is REFUSED while the MAC is off — reading ISR on a dead MAC is
@@ -625,7 +748,7 @@ void RTW88Ethernet::txEthFrame(const uint8_t *eth, uint32_t ethlen)
     uint16_t et = (uint16_t)((eth[12] << 8) | eth[13]);
     const uint8_t *payload = eth + 14;
     uint32_t plen = ethlen - 14;
-    uint32_t airlen = 24 + 8 + 8 + plen;      /* hdr + CCMP-IV + LLC-SNAP + payload */
+    uint32_t airlen = 26 + 8 + 8 + plen;      /* QoS hdr + CCMP-IV + LLC-SNAP + payload */
     if (fDescSz + airlen > fTxSlotSz) return; /* too big for a slot */
 
     /* flow control: don't reuse a slot the HW hasn't transmitted (BEQ read idx
@@ -643,19 +766,23 @@ void RTW88Ethernet::txEthFrame(const uint8_t *eth, uint32_t ethlen)
     uint64_t  bufpa = fTxPoolPa + (uint64_t)slot * fTxSlotSz;
     uint8_t  *body = buf + fDescSz;
 
-    body[0] = 0x08; body[1] = 0x41; body[2] = 0; body[3] = 0;   /* data, ToDS, Protected */
+    /* QoS Data, ToDS, Protected. A QoS-tagged uplink is what lets the AP set up an
+     * uplink Block-Ack session (non-QoS Data could never aggregate). TID 0 -> the BE
+     * access category, which is exactly the BE queue we ring below. */
+    body[0] = 0x88; body[1] = 0x41; body[2] = 0; body[3] = 0;   /* QoS data, ToDS, Protected */
     memcpy(body + 4, fBssid, 6); memcpy(body + 10, fMac.bytes, 6); memcpy(body + 16, dst, 6);
-    body[22] = 0; body[23] = 0;
+    body[22] = 0; body[23] = 0;                                 /* seq (HW fills via EN_HWSEQ) */
+    body[24] = 0; body[25] = 0;                                 /* QoS Control: TID 0, normal ack */
     uint64_t pn = fCcmpPn++;
-    uint8_t *iv = body + 24;
+    uint8_t *iv = body + 26;
     iv[0] = (uint8_t)pn;        iv[1] = (uint8_t)(pn >> 8);
     iv[2] = 0;                  iv[3] = 0x20;                    /* ExtIV, keyid 0 */
     iv[4] = (uint8_t)(pn >> 16); iv[5] = (uint8_t)(pn >> 24);
     iv[6] = (uint8_t)(pn >> 32); iv[7] = (uint8_t)(pn >> 40);
-    uint8_t *llc = body + 32;
+    uint8_t *llc = body + 34;
     llc[0] = 0xaa; llc[1] = 0xaa; llc[2] = 0x03; llc[3] = 0; llc[4] = 0; llc[5] = 0;
     llc[6] = (uint8_t)(et >> 8); llc[7] = (uint8_t)et;
-    memcpy(body + 40, payload, plen);
+    memcpy(body + 42, payload, plen);
 
     /* TX descriptor (48B) — same fields as the userspace path. Bulk data: let the
      * firmware rate-adaptation drive the rate (USE_RATE/DISDATAFB cleared, RATE_ID
@@ -664,10 +791,10 @@ void RTW88Ethernet::txEthFrame(const uint8_t *eth, uint32_t ethlen)
     uint32_t rate_id = fRateId;
     memset(buf, 0, fDescSz);
     uint32_t *w = (uint32_t *)buf;
-    w[0] = (airlen & 0xffff) | ((fDescSz & 0xff) << 16) | (1u << 26);   /* SIZE|OFFSET|LS */
-    w[1] = (3u << 22) | (rate_id << 16);                               /* SEC_TYPE=CCMP | RATE_ID (QSEL=BE=0, MACID=0) */
-    w[4] = (uint32_t)(fRate & 0x7f);                                    /* DATARATE (init hint) */
-    w[8] = (1u << 31);                                                  /* EN_HWSEQ */
+    w[0] = (airlen & 0xffff) | ((fDescSz & 0xff) << KTX_W0_OFFSET_SHIFT) | KTX_W0_LS;   /* SIZE|OFFSET|LS */
+    w[1] = (3u << KTX_W1_SECTYPE_SHIFT) | (rate_id << KTX_W1_RATEID_SHIFT);             /* SEC_TYPE=CCMP | RATE_ID (QSEL=BE=0, MACID=0) */
+    w[4] = (uint32_t)(fRate & 0x7f);                                                    /* DATARATE (init hint) */
+    w[8] = KTX_W8_EN_HWSEQ;
 
     uint32_t total = airlen + fDescSz;
     uint32_t psb = (total - 1) / 128 + 1;
@@ -704,11 +831,11 @@ void RTW88Ethernet::txAction(const uint8_t *frame, uint32_t flen)
 
     memset(buf, 0, fDescSz);
     uint32_t *w = (uint32_t *)buf;
-    w[0] = (flen & 0xffff) | ((fDescSz & 0xff) << 16) | (1u << 26);    /* SIZE|OFFSET|LS */
+    w[0] = (flen & 0xffff) | ((fDescSz & 0xff) << KTX_W0_OFFSET_SHIFT) | KTX_W0_LS;   /* SIZE|OFFSET|LS */
     w[1] = 0;                                                          /* QSEL=BE, MACID 0, sec_type 0 (unencrypted) */
-    w[3] = (1u << 8) | (1u << 10);                                     /* USE_RATE | DISDATAFB */
+    w[3] = KTX_W3_USE_RATE | KTX_W3_DISDATAFB;                         /* USE_RATE | DISDATAFB */
     w[4] = 0x04;                                                       /* DESC_RATE6M (basic OFDM) */
-    w[8] = (1u << 31);                                                 /* EN_HWSEQ */
+    w[8] = KTX_W8_EN_HWSEQ;
 
     uint32_t total = flen + fDescSz;
     uint32_t psb = (total - 1) / 128 + 1;
@@ -740,6 +867,22 @@ void RTW88Ethernet::handleAddbaReq(const uint8_t *f, uint32_t len)
     uint16_t ba_timeout = (uint16_t)(rq[5] | (rq[6] << 8));
     uint8_t  tid        = (uint8_t)((ba_param >> 2) & 0xf);
 
+    /* We only reorder the 8 EDCA TIDs (fBa[RTW_BA_TID_NUM]); don't accept a Block-Ack
+     * for a TID we can't reorder, or its A-MPDU would bypass the reorder engine. */
+    if (tid >= RTW_BA_TID_NUM) {
+        IOLog("RTW88: ADDBA req for TID %u (>=%u) declined — no reorder window\n", tid, RTW_BA_TID_NUM);
+        return;
+    }
+
+    /* Cap the agreed buffer size to what we can actually reorder (RTW_BA_WIN_MAX). A
+     * spec value of 0 means "originator's choice", so pick our max. We MUST advertise
+     * the capped value back: otherwise the AP runs up to its larger window ahead of
+     * head and our window-slide drops still-in-flight frames as stale. Preserve the
+     * AMSDU(bit0)/policy(bit1)/TID(bits5:2) subfields, overwrite only bufsize(bits15:6). */
+    uint16_t bufsz = (uint16_t)((ba_param >> 6) & 0x3ff);
+    if (bufsz == 0 || bufsz > RTW_BA_WIN_MAX) bufsz = RTW_BA_WIN_MAX;
+    uint16_t ba_param_out = (uint16_t)((ba_param & 0x003f) | (bufsz << 6));
+
     uint8_t r[33];
     r[0] = 0xd0; r[1] = 0x00; r[2] = 0; r[3] = 0;          /* FC=action, duration */
     memcpy(r + 4,  fBssid, 6);                              /* addr1 = RA = AP   */
@@ -751,12 +894,174 @@ void RTW88Ethernet::handleAddbaReq(const uint8_t *f, uint32_t len)
     rb[1] = 0x01;                                           /* action: ADDBA Response     */
     rb[2] = dialog;                                         /* echo dialog token          */
     rb[3] = 0x00; rb[4] = 0x00;                             /* status code = success      */
-    rb[5] = (uint8_t)ba_param; rb[6] = (uint8_t)(ba_param >> 8);   /* echo BA params (TID/bufsize/policy) */
+    rb[5] = (uint8_t)ba_param_out; rb[6] = (uint8_t)(ba_param_out >> 8);  /* BA params, bufsize capped */
     rb[7] = (uint8_t)ba_timeout; rb[8] = (uint8_t)(ba_timeout >> 8);
     txAction(r, 33);
 
     gAddba++;
-    IOLog("RTW88: ADDBA req (tid %u) -> ADDBA resp accepted; HW Block-Ack on\n", tid);
+    IOLog("RTW88: ADDBA req (tid %u, bufsz %u) -> ADDBA resp accepted; HW Block-Ack on\n", tid, bufsz);
+
+    /* spin up this TID's reorder window from the negotiated SSN + (capped) buffer size. */
+    uint16_t ba_ssc = (uint16_t)(rq[7] | (rq[8] << 8));
+    reorderActivate(tid, (uint16_t)(ba_ssc >> 4), bufsz);
+}
+
+/* DELBA: flush the TID's buffered frames in order and free the window. */
+void RTW88Ethernet::handleDelba(const uint8_t *f, uint32_t len)
+{
+    if (len < 24 + 6) return;
+    uint16_t params = (uint16_t)(f[26] | (f[27] << 8));     /* DELBA params: TID = bits[15:12] */
+    uint8_t  tid    = (uint8_t)((params >> 12) & 0xf);
+    if (tid < RTW_BA_TID_NUM) reorderDeactivate(tid);
+}
+
+#pragma mark - per-TID A-MPDU RX reorder buffer (mac80211 tid_ampdu_rx port)
+
+void RTW88Ethernet::reorderActivate(uint8_t tid, uint16_t ssn, uint16_t win)
+{
+    if (tid >= RTW_BA_TID_NUM) return;
+    ReorderTid *rt = &fBa[tid];
+    if (win < 1) win = 1; if (win > RTW_BA_WIN_MAX) win = RTW_BA_WIN_MAX;
+    /* Re-ADDBA on an already-active TID (the AP re-issues ADDBA after BAR recovery, a
+     * session timeout or a roam): deliver everything still buffered, IN ORDER, before
+     * restarting from the new SSN — abandoning it would punch a permanent hole in the
+     * TCP stream. Runs against the OLD head/win, so it must precede their reset. */
+    if (rt->active && rt->store && rt->stored) {
+        for (uint16_t k = 0; k < rt->win; k++) {
+            uint32_t idx = RTW_REORDER_IDX(rt->head + k);
+            if (rt->occ[idx]) deliverSlot(rt, idx);
+        }
+    }
+    /* Reuse the existing window buffer across a re-ADDBA; only allocate the first time.
+     * The slot index is sn & (RTW_BA_WIN_MAX-1), so store must stay full-size regardless
+     * of `win`. */
+    if (!rt->store) {
+        rt->store = (uint8_t *)IOMalloc((size_t)RTW_BA_WIN_MAX * RTW_REORDER_SLOT_SZ);
+        if (!rt->store) { rt->active = false; return; }
+    }
+    for (uint32_t i = 0; i < RTW_BA_WIN_MAX; i++) rt->occ[i] = false;
+    rt->head = (uint16_t)(ssn & 0xfff);
+    rt->win = win; rt->stored = 0; rt->started = false; rt->active = true;
+    gReordActiveMask |= (1u << tid);
+    IOLog("RTW88: reorder TID %u ON (ssn %u win %u)\n", tid, rt->head, win);
+}
+
+void RTW88Ethernet::deliverSlot(ReorderTid *rt, uint32_t idx)
+{
+    if (!rt->occ[idx]) return;
+    deliverMpdu(rt->store + (uint64_t)idx * RTW_REORDER_SLOT_SZ, rt->len[idx]);
+    rt->occ[idx] = false;
+    if (rt->stored) rt->stored--;
+    gReordRel++;
+}
+
+uint32_t RTW88Ethernet::reorderDrainReady(ReorderTid *rt)
+{
+    uint32_t released = 0;
+    for (;;) {
+        uint32_t idx = RTW_REORDER_IDX(rt->head);
+        if (!rt->occ[idx]) break;
+        deliverSlot(rt, idx);
+        rt->head = rtw_sn_inc(rt->head);
+        released++;
+    }
+    return released;
+}
+
+void RTW88Ethernet::reorderInsert(uint8_t tid, uint16_t sn, const uint8_t *f, uint32_t len)
+{
+    ReorderTid *rt = &fBa[tid];
+    uint16_t win = rt->win;
+    if (!rt->started) {
+        if (rtw_sn_less(sn, rt->head)) { deliverMpdu(f, len); return; }
+        rt->started = true;
+    }
+    if (rtw_sn_less(sn, rt->head)) { gReordStale++; return; }           /* (A) stale -> drop */
+    if (!rtw_sn_less(sn, (uint16_t)((rt->head + win) & 0xfff))) {       /* (B) beyond window -> slide */
+        uint16_t newhead = rtw_sn_inc(rtw_sn_sub(sn, win));
+        /* Slide head up to newhead, delivering occupied slots in order. Only `win` slots
+         * can ever be occupied, so iterate at most `win` times regardless of how far sn
+         * jumped — a raw per-SN walk could spin ~2047 times on the rxLoop hot path. */
+        uint16_t steps = rtw_sn_sub(newhead, rt->head);
+        if (steps > win) steps = win;
+        for (uint16_t k = 0; k < steps; k++) {
+            uint32_t idx = RTW_REORDER_IDX(rt->head + k);
+            if (rt->occ[idx]) deliverSlot(rt, idx);
+        }
+        rt->head = newhead;
+    }
+    uint32_t index = RTW_REORDER_IDX(sn);
+    if (rt->occ[index]) { gReordDup++; return; }                       /* (C) duplicate */
+    if (sn == rt->head && rt->stored == 0) {                           /* (D) fast path */
+        rt->head = rtw_sn_inc(rt->head);
+        gReordRel++;
+        deliverMpdu(f, len);
+        return;
+    }
+    if (len > RTW_REORDER_SLOT_SZ) { deliverMpdu(f, len); return; }     /* (E) buffer */
+    memcpy(rt->store + (uint64_t)index * RTW_REORDER_SLOT_SZ, f, len);
+    rt->len[index] = len;
+    rt->t_ns[index] = rtw_uptime_ns();
+    rt->occ[index] = true;
+    rt->stored++;
+    gReordBuf++;
+    reorderDrainReady(rt);
+}
+
+/* periodic sweep: when the head slot is a hole older than 100ms, skip it and release
+ * what's waiting behind. Called every rxLoop pass (incl. idle). */
+uint32_t RTW88Ethernet::reorderTimeoutAll()
+{
+    uint32_t released = 0; uint64_t now = 0;
+    for (uint8_t tid = 0; tid < RTW_BA_TID_NUM; tid++) {
+        ReorderTid *rt = &fBa[tid];
+        if (!rt->active || rt->stored == 0) continue;
+        if (!now) now = rtw_uptime_ns();
+        for (;;) {
+            uint32_t idx = RTW_REORDER_IDX(rt->head);
+            if (rt->occ[idx]) { released += reorderDrainReady(rt); break; }
+            if (rt->stored == 0) break;
+            uint32_t jdist = 0, jidx = 0; bool found = false;
+            for (uint32_t k = 1; k < rt->win; k++) {
+                uint32_t i = RTW_REORDER_IDX(rt->head + k);
+                if (rt->occ[i]) { found = true; jdist = k; jidx = i; break; }
+            }
+            if (!found) break;
+            if (now <= rt->t_ns[jidx] + RTW_REORDER_TIMEOUT_NS) break;
+            gReordTo += jdist;
+            rt->head = (uint16_t)((rt->head + jdist) & 0xfff);
+            released += reorderDrainReady(rt);
+        }
+    }
+    return released;
+}
+
+void RTW88Ethernet::reorderDeactivate(uint8_t tid)
+{
+    if (tid >= RTW_BA_TID_NUM) return;
+    ReorderTid *rt = &fBa[tid];
+    if (!rt->active) return;
+    if (rt->store) {
+        for (uint32_t k = 0; k < rt->win; k++) {
+            uint32_t idx = RTW_REORDER_IDX(rt->head + k);
+            if (rt->occ[idx]) deliverSlot(rt, idx);
+        }
+        IOFree(rt->store, (size_t)RTW_BA_WIN_MAX * RTW_REORDER_SLOT_SZ);
+        rt->store = nullptr;
+    }
+    rt->active = false; rt->started = false; rt->stored = 0;
+    gReordActiveMask &= ~(1u << tid);
+    IOLog("RTW88: reorder TID %u OFF\n", tid);
+}
+
+void RTW88Ethernet::reorderFreeAll()
+{
+    for (uint8_t tid = 0; tid < RTW_BA_TID_NUM; tid++) {
+        ReorderTid *rt = &fBa[tid];
+        if (rt->store) { IOFree(rt->store, (size_t)RTW_BA_WIN_MAX * RTW_REORDER_SLOT_SZ); rt->store = nullptr; }
+        rt->active = false; rt->started = false; rt->stored = 0;
+    }
+    gReordActiveMask = 0;
 }
 
 /* the IOEthernetController output path: in data mode do the full TX in-kernel */
@@ -769,22 +1074,29 @@ void RTW88Ethernet::inputEth(const uint8_t *data, uint32_t len)
     if (!m) return;
     if (mbuf_copyback(m, 0, len, data, MBUF_DONTWAIT) != 0) { freePacket(m); return; }
     fNetif->inputPacket(m, len, IONetworkInterface::kInputOptionQueuePacket);   /* rxLoop flushes once per drain */
+    fPendingFlush = true;
 }
 
-/* one received 802.11 data frame -> Ethernet -> stack */
+/* dispatch one received 802.11 frame: BlockAck action frames (ADDBA/DELBA), then DATA
+ * frames -> per-TID reorder -> deliverMpdu. Runs on the rxLoop thread. */
 void RTW88Ethernet::rxFrame(const uint8_t *f, uint32_t pkt_len)
 {
     uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
-    /* management Action frame? (type=00, subtype=1101 -> f[0]==0xd0). Answer the AP's
-     * ADDBA Request (BlockAck category 3, action 0) to enable downlink aggregation. */
+    /* management Action frame? (type=00, subtype=1101 -> f[0]==0xd0). BlockAck category
+     * (3): action 0 = ADDBA Request (enable downlink aggregation), action 2 = DELBA. */
     if ((f[0] & 0x0c) == 0x00) {                            /* type = management */
-        if ((f[0] & 0xf0) == 0xd0 && pkt_len >= 26 && f[24] == 0x03 && f[25] == 0x00)
-            handleAddbaReq(f, pkt_len);
+        if ((f[0] & 0xf0) == 0xd0 && pkt_len >= 26 && f[24] == 0x03) {
+            if (f[25] == 0x00)      handleAddbaReq(f, pkt_len);
+            else if (f[25] == 0x02) handleDelba(f, pkt_len);
+        }
         return;
     }
     if (((fc >> 2) & 3) != 2) return;                       /* else DATA frames only */
     gDrx++; if (f[1] & 0x08) gDrxRetry++;                    /* retry bit = AP resend */
-    bool qos = ((fc >> 4) & 0x8);
+    /* QoS data needs the 2-byte QoS Control at f[24..25]; only treat a frame as QoS when
+     * the declared length actually covers it, so the f[24] reads below can't fall past
+     * the MPDU (rxLoop only guarantees pkt_len >= 24). */
+    bool qos = ((fc >> 4) & 0x8) && pkt_len >= 26;
     /* diagnostic: 802.11 Sequence Control (f[22..23], seq = bits[15:4]). */
     {
         uint16_t seq = (uint16_t)(((f[22] | (f[23] << 8)) >> 4) & 0xfff);
@@ -817,53 +1129,94 @@ void RTW88Ethernet::rxFrame(const uint8_t *f, uint32_t pkt_len)
         }
         gLastSeqTid[tid] = seq;
     }
-    /* header = 24 + QoS-control(2) + HT-Control(4, present when Order/+HTC, fc bit15)
-     * + CCMP-header(8, present when Protected, fc bit14). VHT APs set +HTC on data
-     * frames for link-adaptation feedback; missing those 4 bytes shifts the payload
-     * and the frame fails to parse (the residual `pdrop`). The HW decrypts in place
-     * but leaves the CCMP header, so the MSDU starts after it. */
-    uint32_t hdr = 24 + (qos ? 2 : 0) + (((fc >> 15) & 1) ? 4 : 0) + (((fc >> 14) & 1) ? 8 : 0);
-    if (pkt_len < hdr + 8) { gDrxParse++; return; }
+    /* per-TID A-MPDU reorder: QoS unicast in an active BA session -> reorder; everything
+     * else (mgmt/multicast/non-QoS/no-session) delivers immediately, in order. */
+    if (qos && !(f[4] & 0x01)) {
+        uint8_t rtid   = (uint8_t)(f[24] & 0x07);
+        uint8_t ackpol = (uint8_t)((f[24] >> 5) & 0x03);
+        if (fBa[rtid].active && ackpol != 0x01) {
+            uint16_t sn = (uint16_t)(((f[22] | (f[23] << 8)) >> 4) & 0xfff);
+            reorderInsert(rtid, sn, f, pkt_len);
+            return;
+        }
+    }
+    deliverMpdu(f, pkt_len);
+}
 
-    /* A-MSDU (QoS control octet0 bit7): one MPDU carries several Ethernet subframes
-     * back-to-back — {DA(6),SA(6),len(2),MSDU(len)} each padded to 4 bytes. These are
-     * the efficient aggregated frames; not splitting them was dropping ~10% of RX
-     * (the `pdrop` counter) and starving TCP. Deliver each subframe up the stack. */
-    if (qos && (f[24] & 0x80)) {
-        const uint8_t *p = f + hdr;
-        uint32_t rem = pkt_len - hdr;
-        int delivered = 0;
+/* Is `cand` a plausible 802.11 header length? For A-MSDU the first subframe's LLC sits
+ * at cand+14; otherwise the MSDU LLC sits at cand. Used to resolve the +HTC ambiguity. */
+static inline bool rtw_hdr_ok(const uint8_t *f, uint32_t pkt_len, bool amsdu, uint32_t cand)
+{
+    if (cand + 8 > pkt_len) return false;
+    if (amsdu) {
+        const uint8_t *p = f + cand; uint32_t rem = pkt_len - cand;
+        if (rem < 14 + 8) return false;
+        uint32_t sublen = (uint32_t)((p[12] << 8) | p[13]);
+        if (sublen < 8 || 14 + sublen > rem) return false;
+        const uint8_t *s = p + 14;
+        return s[0] == 0xaa && s[1] == 0xaa && s[2] == 0x03;
+    }
+    const uint8_t *l = f + cand;
+    return l[0] == 0xaa && l[1] == 0xaa && l[2] == 0x03;
+}
+
+/* parse one in-order data MPDU -> Ethernet frame(s) -> stack (A-MSDU split inline).
+ * Robust to the VHT +HTC ambiguity: the chip may or may not carry the 4-byte HT-Control
+ * field even with the FC Order bit set, which shifts the LLC — the dominant ~14% parse
+ * drop. Try the FC-implied offset, else the other HTC choice; pick whichever has a valid
+ * LLC. The HW decrypts in place but leaves the 8-byte CCMP header, so the MSDU is after it. */
+void RTW88Ethernet::deliverMpdu(const uint8_t *f, uint32_t pkt_len)
+{
+    uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
+    bool qos   = ((fc >> 4) & 0x8) && pkt_len >= 26;   /* QoS Control at f[24..25] must be in-frame */
+    bool amsdu = qos && (f[24] & 0x80);
+    uint32_t base  = 24 + (qos ? 2 : 0) + (((fc >> 14) & 1) ? 8 : 0);   /* + CCMP, no HTC yet */
+    uint32_t fchtc = ((fc >> 15) & 1) ? 4 : 0;                          /* FC Order => +HTC   */
+    uint32_t cands[2] = { base + fchtc, base + (fchtc ? 0 : 4) };       /* FC-implied, then the other */
+
+    uint32_t hdr = 0; bool found = false;
+    for (int i = 0; i < 2; i++)
+        if (rtw_hdr_ok(f, pkt_len, amsdu, cands[i])) { hdr = cands[i]; found = true; if (i) gPHtcFix++; break; }
+    if (!found) {
+        if (base + 8 > pkt_len)      gPShort++;
+        else if (amsdu)              gPAmsdu++;
+        else                         gPLlc++;
+        gDrxParse++;
+        return;
+    }
+
+    if (amsdu) {                                            /* {DA(6),SA(6),len(2),MSDU} subframes */
+        const uint8_t *p = f + hdr; uint32_t rem = pkt_len - hdr; int delivered = 0;
         while (rem >= 14) {
-            uint32_t sublen = (uint32_t)((p[12] << 8) | p[13]);  /* MSDU length */
+            uint32_t sublen = (uint32_t)((p[12] << 8) | p[13]);
             if (sublen < 8 || 14 + sublen > rem) break;
-            const uint8_t *sllc = p + 14;                        /* MSDU = LLC/SNAP + payload */
+            const uint8_t *sllc = p + 14;
             if (sllc[0] == 0xaa && sllc[1] == 0xaa && sllc[2] == 0x03) {
                 uint32_t plen = sublen - 8;
                 if (plen <= 1600) {
                     uint8_t eth[1614];
-                    memcpy(eth, p, 12);                          /* subframe DA + SA */
-                    eth[12] = sllc[6]; eth[13] = sllc[7];        /* ethertype */
+                    memcpy(eth, p, 12);
+                    eth[12] = sllc[6]; eth[13] = sllc[7];
                     memcpy(eth + 14, sllc + 8, plen);
                     inputEth(eth, 14 + plen);
                     delivered++;
                 }
             }
-            uint32_t adv = (14 + sublen + 3) & ~3u;              /* next subframe (4-byte aligned) */
+            uint32_t adv = (14 + sublen + 3) & ~3u;
             if (adv > rem) break;
             p += adv; rem -= adv;
         }
-        if (!delivered) gDrxParse++;
+        if (!delivered) { gPAmsdu++; gDrxParse++; }
         return;
     }
 
     const uint8_t *llc = f + hdr;
-    if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 0x03) { gDrxParse++; return; }
     uint16_t et = (uint16_t)((llc[6] << 8) | llc[7]);
     uint32_t plen = pkt_len - hdr - 8;
-    if (plen > 1600) { gDrxParse++; return; }
+    if (plen > 1600) { gPBig++; gDrxParse++; return; }
     uint8_t eth[1614];
-    memcpy(eth, f + 4, 6);        /* addr1 = DA (us / bcast / mcast) */
-    memcpy(eth + 6, f + 16, 6);   /* addr3 = SA                       */
+    memcpy(eth, f + 4, 6);        /* addr1 = DA (us)  */
+    memcpy(eth + 6, f + 16, 6);   /* addr3 = SA       */
     eth[12] = (uint8_t)(et >> 8); eth[13] = (uint8_t)et;
     memcpy(eth + 14, llc + 8, plen);
     inputEth(eth, 14 + plen);
@@ -880,7 +1233,7 @@ void RTW88Ethernet::rxLoop()
         uint32_t depth = (hw - fRxRp + fRxN) % fRxN;    /* current ring occupancy */
         if (depth > gDrxMaxDepth) gDrxMaxDepth = depth;
         if (depth >= fRxN - 2) gRxRingFull++;   /* HW has lapped us -> frames overwritten */
-        bool got = false, delivered = false;
+        bool got = false;
         while (fRxRp != hw && !fRxStop) {
             uint8_t *buf = fRxData + (uint64_t)fRxRp * fRxBufSz;
             uint32_t w0 = *(volatile uint32_t *)buf;
@@ -892,20 +1245,82 @@ void RTW88Ethernet::rxLoop()
                 if (rate >= 12) gDrxMcs++;             /* >=12 = HT/VHT MCS */
                 gRateSum += rate; gRateN++;            /* avg + peak PHY rate the AP gives us */
                 if (rate > gRateMax) gRateMax = rate;
+                if (rate < gRateMin) gRateMin = rate;  /* min: low => AP flooring us to MCS0/CCK */
                 gDrxBytes += pkt_len;
                 uint32_t off = fRxDescSz + shift + drv * 8;
-                if (off + pkt_len <= fRxBufSz) { rxFrame(buf + off, pkt_len); delivered = true; }
+                if (off + pkt_len <= fRxBufSz) rxFrame(buf + off, pkt_len);
             }
             fRxRp = (fRxRp + 1) % fRxN;
             got = true;
         }
         if (got) mmioW16(RTK_PCI_RXBD_IDX_MPDUQ_K, (uint16_t)(fRxRp & 0xfff));   /* release */
-        if (delivered && fNetif) fNetif->flushInputQueue();   /* one stack flush per drain (batched) */
+        /* release any reorder-buffered frames whose missing predecessor has timed out (100ms),
+         * every pass incl. idle, so a never-retransmitted hole can't stall the flow. */
+        reorderTimeoutAll();
+        if (fPendingFlush && fRunning && fNetif) { fNetif->flushInputQueue(); fPendingFlush = false; }
+
+        /* DIG: dynamic initial RX gain. The AGC table leaves IGI static; at close range a
+         * too-sensitive gain saturates the receiver so frames go undetected (clean but absent
+         * — the measured ~40% loss). Every 2s, read the OFDM false-alarm count and nudge IGI
+         * (REG 0xc50[6:0]) toward a less-sensitive target (0x32) and hard-cap it at 0x3e.
+         * Self-correcting + bounded, so a wrong start can't run away. The operating range
+         * is [0x32,0x3e]: at low FA we settle at 0x32 (backing gain off a strong close
+         * signal), raising further only when FA actually appears. Thresholds: rtw_phy_dig. */
+        {
+            uint64_t a = 0, nowNs = 0;
+            clock_get_uptime(&a); absolutetime_to_nanoseconds(a, &nowNs);
+            uint32_t igi = fDigIgi;
+            if (!fDigInit) { igi = mmioR32(0xc50) & 0x7f; fDigInit = true; }
+            if (nowNs - fDigLastNs > 2000000000ull) {
+                fDigLastNs = nowNs;
+                uint32_t fa = mmioR32(0x0f48) & 0xffff;            /* REG_FA_OFDM */
+                uint32_t fas = mmioR32(0x09a4);                    /* REG_FAS: reset FA counters */
+                mmioW32(0x09a4, fas |  (1u << 17));
+                mmioW32(0x09a4, fas & ~(1u << 17));
+                /* DIG only sees false-alarms, so at a strong close-range signal it would
+                 * floor the gain to max sensitivity (0x1c) — but an over-sensitive receiver
+                 * on a strong signal SATURATES/clips and drops frames WITHOUT raising FA
+                 * (the ~40% loss with fa~0). Windows backs gain OFF on strong signal. So at
+                 * low FA, settle toward a less-sensitive 0x32 rather than the floor; raise
+                 * further only if FA actually appears. */
+                const uint32_t DIG_TARGET = 0x32;
+                if      (fa > 750 && igi < 0x3e)        igi += 2;
+                else if (fa > 250 && igi < 0x3e)        igi += 1;
+                else if (igi > DIG_TARGET)              igi -= 1;   /* low FA -> drift down to target */
+                else if (igi < DIG_TARGET)              igi += 1;   /* ...and up to target */
+                if (igi > 0x3e) igi = 0x3e;                         /* hard cap (the +2 step can overshoot to 0x3f) */
+                mmioW32(0xc50, (mmioR32(0xc50) & ~0x7fu) | (igi & 0x7f));
+                fDigIgi = igi; gDigFa = fa; gDigIgi = igi;
+            }
+        }
+
+        /* passive RX health snapshot every ~10s -> system log (reads counters; no behavior
+         * change). rate codes: <12 legacy/CCK, 12-27 HT, >=44 VHT. parse breakdown: htcfix =
+         * frames recovered via the +/-HTC retry; llc/amsdu/short/big = unrecovered drops. */
+        {
+            uint64_t a = 0, nowNs = 0;
+            clock_get_uptime(&a); absolutetime_to_nanoseconds(a, &nowNs);
+            if (nowNs - fHealthLastNs > 10000000000ull) {
+                fHealthLastNs = nowNs;
+                uint64_t n = gRateN;
+                IOLog("RTW-health: rx=%llu err=%llu retry=%llu rate[avg=%llu max=%llu min=%llu] "
+                      "ringFull=%llu maxDepth=%llu txDrop=%llu | reorder[active=0x%x rel=%llu buf=%llu timeout=%llu stale=%llu dup=%llu] "
+                      "| parse=%llu{htcfix=%llu llc=%llu amsdu=%llu short=%llu big=%llu} | dig[igi=0x%x fa=%llu]\n",
+                      gDrx, gDrxErr, gDrxRetry,
+                      n ? gRateSum / n : 0, gRateMax, n ? gRateMin : 0,
+                      gRxRingFull, gDrxMaxDepth, gDtxDrop,
+                      gReordActiveMask, gReordRel, gReordBuf, gReordTo, gReordStale, gReordDup,
+                      gDrxParse, gPHtcFix, gPLlc, gPAmsdu, gPShort, gPBig,
+                      gDigIgi, gDigFa);
+            }
+        }
         /* low-latency idle: keep spinning briefly after activity (download inter-burst
          * gaps are sub-ms — a 1ms sleep there inflates the RTT and paces TCP down),
          * fall back to a real sleep only once the link is genuinely quiet. */
         if (got) idle = 0;
-        else if (++idle < 64) IODelay(50);
+        else if (++idle < 20) IODelay(50);   /* ~1ms of low-latency spin covers sub-ms
+                                               * inter-burst gaps; was 3.2ms — that pegged
+                                               * a core. Drop to IOSleep once truly idle. */
         else IOSleep(1);
     }
     fRxDone = true;
@@ -938,22 +1353,29 @@ bool RTW88Ethernet::startData(RTW88Server *server, const struct rtw_data_cfg *cf
     fRate   = cfg->rate;
     fRateId = cfg->rate_id ? cfg->rate_id : 7;   /* fall back to legacy OFDM raid */
 
-    /* our own per-slot TX buffer pool (the userspace BE ring shared one buffer) */
+    /* per-slot TX buffer pool — borrowed from the allocate-once trx pool by handle, so
+     * it is never freed across connect/disconnect churn. On this no-IOMMU box a queued
+     * BE BD's in-flight DMA read can only ever land in still-wired memory. */
     fTxSlotSz = RTW_ETH_SLOT_SIZE;
-    fTxPool = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionOut | kIOMemoryPhysicallyContiguous,
-        (uint64_t)fBeLen * fTxSlotSz, 0x00000000FFFFF000ULL);
-    if (!fTxPool || fTxPool->prepare() != kIOReturnSuccess) return false;
-    fTxPoolV = (uint8_t *)fTxPool->getBytesNoCopy();
-    IOByteCount seg = 0;
-    fTxPoolPa = fTxPool->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
-    if (!fTxPoolV || !fTxPoolPa) return false;
+    uint8_t *txpV; uint64_t txpPa, txpSz;
+    if (!server->dmaResolve(cfg->txpool_handle, &txpV, &txpPa, &txpSz)) return false;
+    if ((uint64_t)fBeLen * fTxSlotSz > txpSz) return false;
+    fTxPoolV = txpV; fTxPoolPa = txpPa;
 
-    /* take over the rings at their current positions */
-    fBeWp = mmioR32(RTK_PCI_TXBD_IDX_BEQ_K) & 0xfff;
-    fRxRp = (mmioR32(RTK_PCI_RXBD_IDX_MPDUQ_K) >> 16) & 0xfff;
+    /* take over the rings at their current positions. Reduce modulo the ring length
+     * (not just mask to 12 bits): a HW index outside [0,len) would index past the BD
+     * ring / TX pool on the first access before the `% len` wrap self-corrects. */
+    fBeWp = (mmioR32(RTK_PCI_TXBD_IDX_BEQ_K) & 0xfff) % fBeLen;
+    fRxRp = ((mmioR32(RTK_PCI_RXBD_IDX_MPDUQ_K) >> 16) & 0xfff) % fRxN;
     fCcmpPn = 1;
+    fDigInit = false; fDigIgi = 0x20; fDigLastNs = 0; fHealthLastNs = 0;   /* fresh DIG/log state per link */
     fDataMode = true;
+
+    /* reorder windows start empty; created lazily on each TID's ADDBA. */
+    for (int i = 0; i < RTW_BA_TID_NUM; i++) {
+        fBa[i].active = false; fBa[i].started = false; fBa[i].stored = 0; fBa[i].store = nullptr;
+    }
+    fPendingFlush = false;
 
     fRxStop = false; fRxDone = false;
     if (kernel_thread_start(&RTW88Ethernet::rxThreadTrampoline, this, &fRxThread) != KERN_SUCCESS) {
@@ -969,16 +1391,30 @@ void RTW88Ethernet::stopData()
 {
     if (!fDataMode) return;
     fRxStop = true;
-    for (int i = 0; i < 400 && !fRxDone; i++) IOSleep(5);   /* wait up to ~2s */
-    if (fRxThread != THREAD_NULL) { thread_deallocate(fRxThread); fRxThread = THREAD_NULL; }
+    /* Wait until the rx thread has truly exited before freeing anything it touches
+     * (the reorder windows). It tests fRxStop every pass and its MMIO reads never block
+     * while the MAC is powered, so this resolves within one poll iteration; a fixed
+     * timeout that expired while the thread was still live would be a use-after-free.
+     * Keep a generous ceiling so a pathological hang can't wedge disconnect. */
+    int spins = 0;
+    while (!fRxDone && ++spins <= 2000) IOSleep(5);   /* ~10s hard ceiling */
+    if (!fRxDone) {
+        IOLog("RTW-data: WARNING rx thread still live after 10s — leaking reorder windows to avoid UAF\n");
+    } else {
+        if (fRxThread != THREAD_NULL) { thread_deallocate(fRxThread); fRxThread = THREAD_NULL; }
+        reorderFreeAll();   /* RX thread gone -> safe to free the reorder windows */
+    }
     fDataMode = false;
-    if (fTxPool) { fTxPool->complete(); fTxPool->release(); fTxPool = nullptr; }
+    /* fTxPool is borrowed from the allocate-once trx pool (see startData) — never freed
+     * here, so a still-in-flight TX DMA read can't land in a recycled page. */
+    fTxPoolV = nullptr;
     IOLog("RTW-data: data path stopped\n");
 }
 
 IOReturn RTW88Server::dataStart(const struct rtw_data_cfg *cfg)
 {
     if (fEth) return kIOReturnBusy;
+    disableAspm();   /* re-assert: macOS power mgmt may have re-enabled ASPM since start() */
     RTW88Ethernet *eth = new RTW88Ethernet;
     if (!eth) return kIOReturnNoMemory;
     if (!eth->init(NULL)) { eth->release(); return kIOReturnError; }
@@ -1025,6 +1461,13 @@ IOReturn RTW88Server::dataStats(uint64_t out[21])
     gDtx = gDtxDrop = gDtxBytes = gDrx = gDrxBytes = gDrxRetry = gDrxMcs = gDrxMaxDepth = 0;
     gDrxErr = gDrxParse = gDrxGap = gDrxBack = 0;
     gMiss = gRxRingFull = gRateSum = gRateN = gRateMax = gRetryDup = gBigJump = 0; gTidMask = 0;
+    gRateMin = 0xff;   /* per-interval min (was never reset -> stuck at all-time low) */
+    /* Reset the reorder + parse-breakdown counters together with rx/parse above, so the
+     * in-kernel health log's cross-counter invariants (gDrxParse == sum gP*, reorder vs
+     * rx) stay consistent when both the GUI (this read-reset) and the log consume them.
+     * gReordActiveMask is live state and gDig* are snapshots — deliberately not reset. */
+    gReordBuf = gReordTo = gReordRel = gReordStale = gReordDup = 0;
+    gPShort = gPLlc = gPAmsdu = gPBig = gPHtcFix = 0;
     /* NB: gLastSeqTid[] is running delta state — deliberately NOT reset (would fake a
      * gap on the first frame of each interval). */
     return kIOReturnSuccess;
@@ -1199,10 +1642,16 @@ IOReturn RTW88ServerUserClient::sDmaAlloc(OSObject *t, void *, IOExternalMethodA
     a->scalarOutput[2] = pa >> 32;
     return r;
 }
-IOReturn RTW88ServerUserClient::sDmaFree(OSObject *t, void *, IOExternalMethodArguments *a)
+IOReturn RTW88ServerUserClient::sDmaFree(OSObject *t, void *, IOExternalMethodArguments *)
 {
-    RTW88Server *o = RTW88ServerUserClient_owner(UC(t)); if (!o) return kIOReturnNotAttached;
-    return o->dmaFree(a->scalarInput[0]);
+    /* DMA buffers are allocate-once and live for the kext's lifetime (released only at
+     * stop(), after the chip is quiesced). Freeing one from userspace while the device
+     * may still bus-master into it is the no-IOMMU PTE-corruption footgun this kext is
+     * built to avoid, so the external selector refuses. The single in-kernel pre-arm
+     * fallback (trx_init) frees via the C shim, never through here. */
+    (void)t;
+    IOLog("RTW-bridge: REFUSED kBridgeDmaFree — DMA is kext-owned / allocate-once\n");
+    return kIOReturnUnsupported;
 }
 IOReturn RTW88ServerUserClient::sRegWriteDma(OSObject *t, void *, IOExternalMethodArguments *a)
 {

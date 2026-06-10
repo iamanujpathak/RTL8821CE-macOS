@@ -354,12 +354,13 @@ static int rtw8821c_mac_init(struct rtw_dev *rtwdev)
 	rtw_write8(rtwdev, REG_TCR + 1, WLAN_TX_FUNC_CFG1);
 	rtw_write8(rtwdev, REG_ACKTO_CCK, 0x40);
 	rtw_write8_set(rtwdev, REG_WMAC_TRXPTCL_CTL_H, BIT(1));
-	/* OMITTED (deliberately): upstream writes
-	 *   rtw_write8_set(REG_SND_PTCL_CTRL, BIT_DIS_CHK_VHTSIGB_CRC);
-	 * but neither symbol is defined in any current upstream rtw88 header, so
-	 * the register ADDRESS is unverifiable. It only disables VHT-SIG-B CRC
-	 * checking (11ac robustness) — irrelevant to beacon scanning. Restore once
-	 * the upstream address is confirmed; never guess a hardware reg address. */
+	/* Disable the VHT-SIG-B CRC check. Realtek chips default to checking the CRC of
+	 * VHT-SIG-B in the 802.11ac signal field, but many APs don't compute it — so their
+	 * VHT (5GHz) data frames fail the check and are dropped IN HARDWARE before the
+	 * driver sees them, collapsing downlink while uplink (our TX) is unaffected. This
+	 * is a prime 5GHz-VHT downlink killer. Address verified vs upstream rtw88 bf.h:
+	 *   REG_SND_PTCL_CTRL = 0x0718, BIT_DIS_CHK_VHTSIGB_CRC = BIT(6). */
+	rtw_write8_set(rtwdev, 0x0718 /*REG_SND_PTCL_CTRL*/, BIT(6) /*BIT_DIS_CHK_VHTSIGB_CRC*/);
 	rtw_write32(rtwdev, REG_WMAC_OPTION_FUNCTION + 8, WLAN_MAC_OPT_FUNC2);
 	rtw_write8(rtwdev, REG_WMAC_OPTION_FUNCTION + 4, WLAN_MAC_OPT_NORM_FUNC1);
 

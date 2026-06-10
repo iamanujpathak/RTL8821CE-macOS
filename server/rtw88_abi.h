@@ -135,6 +135,7 @@ struct rtw_data_cfg {
     uint32_t rx_nslots;         /* RX slot count                                */
     uint32_t rx_buf_size;       /* RX slot size                                 */
     uint32_t rx_desc_sz;        /* RX descriptor size (24)                      */
+    uint32_t txpool_handle;     /* DMA handle of the per-slot TX buffer pool    */
 };
 
 /* enX TX-ring sizing for the in-kext data path's output queue + per-slot TX pool. */

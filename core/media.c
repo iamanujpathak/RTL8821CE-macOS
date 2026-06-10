@@ -22,6 +22,7 @@
 #define REG_MACID                 0x0610 /* port-0 self-MAC; HW auto-ACKs unicast w/ RA==this */
 #define REG_BSSID                 0x0618
 #define REG_MSR                   0x0102 /* media status: port-0 network type in bits[1:0]   */
+#define REG_RRSR                  0x0440 /* response-rate set: rates HW uses for ACK/BA/CTS  */
 #define MSR_NETTYPE_INFRA         0x02   /* RTW_NET_MGD_LINKED — associated infrastructure STA */
 
 /* one H2C command via the next free mailbox (REG_HMEBOX0..3 + _EX) */
@@ -122,6 +123,14 @@ void media_connect(struct rtw_dev *rtwdev, const u8 *bssid, u8 mac_id, u8 channe
      * Bandwidth stays 20MHz here (channel bonding is a later step), so the rates top
      * out at HT MCS7 (~72Mbps SGI) / VHT MCS8 (~86Mbps) on 1 spatial stream. */
     int five = channel > 14;
+
+    /* response-rate set: the rates the WMAC uses to send our ACK/BlockAck/CTS. Left at the
+     * power-on default, our Block-Acks for the AP's A-MPDU can go out at a rate the AP
+     * mis-decodes -> it treats them as missing, retransmits, then drops MPDUs after its
+     * retry limit (the ~50% downlink holes). Program the band's basic set (upstream
+     * RRSR_INIT_5G=0x150 / RRSR_INIT_2G=0x15f). */
+    hw_write32(REG_RRSR, five ? 0x150 : 0x15f);
+
     u8  raid, vht_en = 0;
     u32 mask;
     const char *mode;
@@ -141,7 +150,8 @@ void media_connect(struct rtw_dev *rtwdev, const u8 *bssid, u8 mac_id, u8 channe
         if (!five) mask |= 0x0000000f;
         mode = "legacy";
     }
-    fw_ra_info(rtwdev, mac_id, raid, mask, 0 /*20MHz*/, 0 /*no SGI*/, vht_en);
+    /* SGI on: we advertise Short-GI-20 in the HT cap; lifts HT MCS7 @20MHz 65->72.2 Mbps. */
+    fw_ra_info(rtwdev, mac_id, raid, mask, 0 /*20MHz*/, 1 /*SGI*/, vht_en);
 
     /* publish the chosen rate table id so the TX data paths stamp it into every data
      * descriptor (must match the raid the firmware RA is running for this MACID). */
