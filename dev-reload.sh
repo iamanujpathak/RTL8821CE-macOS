@@ -1,24 +1,29 @@
 #!/bin/bash
 #
-# dev-reload.sh — rebuild RTW88Client + RTW88Server.kext, reload the kext, and run
-# the client. The one-command dev cycle for testing kext changes (P2a's --kpoweron,
-# and anything after).
+# dev-reload.sh — rebuild rtwd + RTW88Server.kext, reload the kext, and run a
+# command. The one-command dev cycle for testing kext changes.
 #
 # Usage:
-#   bash dev-reload.sh                 # rebuild+reload, then run: RTW88Client --kpoweron
-#   bash dev-reload.sh --config reference/rtw88.conf   # ... run the normal flow instead
-#   bash dev-reload.sh --no-run        # rebuild+reload only, don't run the client
-#   CLIENT_ONLY=1 bash dev-reload.sh   # skip the kext (client-only changes)
+#   bash dev-reload.sh                 # rebuild+reload, then run: rtwd --kpoweron
+#   bash dev-reload.sh --kscan         # ... run a different diagnostic instead
+#   bash dev-reload.sh --no-run        # rebuild+reload only, don't run anything
+#   CLIENT_ONLY=1 bash dev-reload.sh   # skip the kext (userspace-only changes)
 #
-# Needs admin rights for the kext install/load — it calls sudo itself, so run it as
-# your normal user (it'll prompt for your password once).
+# Run it as your NORMAL user (not sudo): it escalates the privileged steps
+# itself, so the build artifacts stay owned by you. Running the whole script
+# under sudo leaves root-owned files in build/ that break the next plain run.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+if [ "$(id -u)" = "0" ]; then
+  echo "ERROR: run as your normal user — the script sudo's the privileged steps itself."
+  exit 1
+fi
 
 KEXT_ID=com.rtw88.RTW88Server
 LE=/Library/Extensions/RTW88Server.kext
 
-# parse a couple of our own flags; everything else is passed to the client
+# parse a couple of our own flags; everything else is passed to rtwd
 RUN=1
 ARGS=()
 for a in "$@"; do
@@ -32,11 +37,12 @@ done
 echo "==> sudo (cached for the privileged steps)"
 sudo -v
 
-echo "==> [1/6] stop auto-connect daemon if running (frees the device)"
-sudo launchctl bootout system/com.rtw88.client 2>/dev/null || true
+echo "==> [1/6] stop the rtwd daemon if running (frees the device)"
+sudo launchctl bootout system/com.rtw88.rtwd 2>/dev/null || true
+sudo launchctl bootout system/com.rtw88.client 2>/dev/null || true   # pre-merge legacy
 
-echo "==> [2/6] build RTW88Client"
-bash client/build.sh >/dev/null && echo "    client built"
+echo "==> [2/6] build rtwd"
+bash client/build.sh >/dev/null && echo "    rtwd built"
 
 if [ "${CLIENT_ONLY:-0}" != "1" ]; then
   echo "==> [3/6] build RTW88Server.kext (clearing stale root-owned bundle first)"
@@ -70,13 +76,13 @@ else
 fi
 
 if [ "$RUN" = "1" ]; then
-  echo "==> [6/6] run: sudo ./build/client/RTW88Client ${ARGS[*]}"
+  echo "==> [6/6] run: sudo ./build/client/rtwd ${ARGS[*]}"
   echo "------------------------------------------------------------"
-  sudo ./build/client/RTW88Client "${ARGS[@]}" || true
+  sudo ./build/client/rtwd "${ARGS[@]}" || true
   echo "------------------------------------------------------------"
   echo "kernel log (RTW88 / scan diag):"
   sudo dmesg 2>/dev/null | grep -iE "RTW88|\[rtw |MSI armed|interrupts serviced|probe-response|TX WORKS|RX ring|antenna|GNT|AUTH resp|ASSOC resp|HANDSHAKE|media-connect|EAPOL|GTK|keys installed|ASSOCIATED" | tail -30 \
     || echo "  (none — use Console.app if dmesg is empty)"
 else
-  echo "==> [6/6] --no-run: skipping client run"
+  echo "==> [6/6] --no-run: skipping the run step"
 fi

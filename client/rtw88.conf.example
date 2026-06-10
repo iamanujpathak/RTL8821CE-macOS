@@ -1,10 +1,16 @@
-# rtw88.conf — RTW88Client settings.  Copy to /usr/local/etc/rtw88.conf and edit.
-# Lines are `key = value`; '#' starts a comment. CLI flags override these.
+# rtw88.conf — saved networks + settings for the rtwd daemon.
+# Copy to /usr/local/etc/rtw88.conf (chmod 600 — it holds passphrases).
+# Lines are `key = value`. A line whose first non-blank character is '#' is a
+# comment; '#' is NOT treated as a comment inside a value, so SSIDs and WPA2
+# passphrases may contain '#' (and spaces) and round-trip safely.
+#
+# rtwd REWRITES this file whenever you join a new network from the GUI/CLI, so
+# hand-written comments are not preserved.
 
 # --- Known networks ---------------------------------------------------------
-# List one or MORE networks. At startup the client scans and joins the
-# strongest one that's in range, so the same config works at home, the office,
-# or off your phone's hotspot. Each `network =` starts an entry; the following
+# List one or MORE networks. On boot (and after any drop) rtwd scans and joins
+# the strongest one in range, so the same config works at home, the office, or
+# off your phone's hotspot. Each `network =` starts an entry; the following
 # `password =` is its passphrase (omit/blank for an open network).
 
 network  = MyHomeWiFi
@@ -15,15 +21,9 @@ password = hotspot-passphrase
 
 # network  = OfficeOpenWiFi      # open network: no password line
 
-# --- Radio / mode -----------------------------------------------------------
+# --- Radio ------------------------------------------------------------------
 # Band to scan: 2.4 | 5 | both   (default both)
 band     = both
-
-# Integration mode:
-#   eth   join, then present a real macOS Ethernet interface (enX); macOS runs its
-#         own DHCP/IP on it and routes the whole system through it (default)
-#   scan  just list visible networks, don't connect
-mode     = eth
 
 # --- Optional static IP (otherwise learned via DHCP automatically) ----------
 # ip      = 192.168.0.50

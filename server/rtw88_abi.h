@@ -1,7 +1,7 @@
 /*
  * rtw88_abi.h — the IOUserClient ABI shared by the RTW88Server kext and the
- * userspace control utility (RTW88Client). ONE definition of the selector numbers
- * and the scalar argument layout, so the two sides can never drift.
+ * userspace daemon/CLI (rtwd). ONE definition of the selector numbers and the
+ * scalar argument layout, so the two sides can never drift.
  *
  * Design note (no-IOMMU platform): this box runs DisableIoMapper=true /
  * npci=0x2000 — there is NO IOMMU. The device bus-masters to RAW physical
@@ -18,7 +18,9 @@
 
 /* Bump if the selector numbers / arg layout change. PING returns it so the
  * userspace side can refuse a mismatched kext. */
-#define RTW_BRIDGE_ABI_VERSION   13  /* v13: + kBridgeKScanChunk (streamed chunked scan) */
+#define RTW_BRIDGE_ABI_VERSION   14  /* v14: privacy flag in rtw_scan_entry; admin-only user
+                                      * client; raw kBridgeRegWrite to DESA ring-base regs
+                                      * refused (use kBridgeRegWriteDma). v13: + kBridgeKScanChunk. */
 #define RTW_BRIDGE_PING_MAGIC     0x52545742u   /* 'RTWB' */
 
 /* Max concurrent DMA buffers. A DMA handle is also the IOConnectMapMemory
@@ -103,7 +105,8 @@ struct rtw_scan_entry {
     uint8_t  channel;
     uint8_t  hidden;
     char     ssid[33];
-    uint8_t  _pad[3];
+    uint8_t  privacy;    /* beacon capability Privacy bit: 1 = encrypted network */
+    uint8_t  _pad[2];
     uint32_t beacons;
 };
 struct rtw_scan_result {

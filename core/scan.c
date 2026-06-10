@@ -27,7 +27,7 @@ void set_channel(struct rtw_dev *rtwdev, u8 channel, u8 bw, u8 primary_ch_idx);
 
 #define RX_PKT_DESC_SZ 24
 
-struct net_entry { u8 bssid[6]; char ssid[33]; u8 channel; int beacons; u8 hidden; };
+struct net_entry { u8 bssid[6]; char ssid[33]; u8 channel; int beacons; u8 hidden; u8 privacy; };
 static struct net_entry g_nets[128];
 static int g_nnets;
 static int g_probe_resp;   /* probe-responses received = our TX was heard */
@@ -49,7 +49,7 @@ static u32 build_probe_req(u8 *buf, const u8 *src_mac)
     return (u32)(p - buf);
 }
 
-static void add_net(const u8 *bssid, const u8 *ssid, u8 ssid_len, u8 channel)
+static void add_net(const u8 *bssid, const u8 *ssid, u8 ssid_len, u8 channel, u8 privacy)
 {
     for (int i = 0; i < g_nnets; i++) {
         if (memcmp(g_nets[i].bssid, bssid, 6) == 0) { g_nets[i].beacons++; return; }
@@ -59,6 +59,7 @@ static void add_net(const u8 *bssid, const u8 *ssid, u8 ssid_len, u8 channel)
     memcpy(n->bssid, bssid, 6);
     n->channel = channel;
     n->beacons = 1;
+    n->privacy = privacy;
     if (ssid_len > 32) ssid_len = 32;
     int printable = ssid_len > 0;
     for (int k = 0; k < ssid_len; k++) if (ssid[k] == 0) printable = 0;
@@ -73,6 +74,7 @@ static void parse_frame(const u8 *buf, u8 channel)
     u32 pkt_len  = w0 & 0x3fff;
     u32 drv_info = (w0 >> 16) & 0xf;
     u32 shift    = (w0 >> 24) & 0x3;
+    if (w0 & (BIT(14) | BIT(15))) return;      /* HW-flagged CRC32/ICV error — corrupt */
     if (pkt_len < 36 || pkt_len > 2048) return;
 
     const u8 *f = buf + RX_PKT_DESC_SZ + shift + drv_info * 8;
@@ -83,15 +85,17 @@ static void parse_frame(const u8 *buf, u8 channel)
     if (subtype == 5) g_probe_resp++;          /* a reply to OUR probe = TX works */
 
     const u8 *bssid = f + 16;                   /* addr3 */
+    /* capability field (after tsf8+interval2): bit4 = Privacy (network is encrypted) */
+    u8 privacy = (f[24 + 10] & 0x10) ? 1 : 0;
     const u8 *ie = f + 24 + 12;                 /* 802.11 hdr + (tsf8+int2+cap2) */
     const u8 *end = f + pkt_len;
     while (ie + 2 <= end) {
         u8 tag = ie[0], len = ie[1];
         if (ie + 2 + len > end) break;
-        if (tag == 0) { add_net(bssid, ie + 2, len, channel); return; }
+        if (tag == 0) { add_net(bssid, ie + 2, len, channel, privacy); return; }
         ie += 2 + len;
     }
-    add_net(bssid, NULL, 0, channel);           /* no SSID IE -> hidden */
+    add_net(bssid, NULL, 0, channel, privacy);  /* no SSID IE -> hidden */
 }
 
 static void drain(struct rtw_dev *rtwdev, u8 channel, u32 *rp)
@@ -175,6 +179,7 @@ int scan_marshal(struct rtw_scan_result *r)
         memcpy(r->nets[i].bssid, g_nets[i].bssid, 6);
         r->nets[i].channel = g_nets[i].channel;
         r->nets[i].hidden  = g_nets[i].hidden;
+        r->nets[i].privacy = g_nets[i].privacy;
         memcpy(r->nets[i].ssid, g_nets[i].ssid, 33);
         r->nets[i].beacons = (u32)g_nets[i].beacons;
     }

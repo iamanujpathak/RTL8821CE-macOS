@@ -159,6 +159,18 @@ uint32_t rtw_kctl_scan(struct rtw_scan_result *out)
     struct rtw_dev d;
     kdev_init(&d);
 
+    /* Same preamble as connect/scan-chunk BEGIN: a previous scan/connect ended in
+     * trx_free(), which disables PCI bus-mastering — without re-enabling it here every
+     * scan after the first is DMA-dead (probe requests never TX, the RX ring never
+     * fills, 0 networks; rtwd's auto-connect then wedges forever). Also tear down any
+     * live data path first: re-running power-on under live RX DMA is the no-IOMMU
+     * corruption hazard. */
+    hw_data_stop();
+    trx_free();
+    g_scan_active   = 0;
+    g_cur_connected = 0;
+    hw_power(1, 1);
+
     int pr = rtw_mac_power_on(&d);
     hw_set_mac_power(1);   /* gate: lets scan_networks' hw_irq_enable() succeed */
     int tr = trx_init(&d);
@@ -245,6 +257,15 @@ void rtw_kctl_connect(const struct rtw_connect_req *req, struct rtw_connect_resu
         132, 136, 140, 149, 153, 157, 161, 165, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
     };
     memset(out, 0, sizeof(*out));
+
+    /* The struct arrives as a verbatim copy-in from userspace: nothing guarantees the
+     * ssid/pass arrays are NUL-terminated, and both are strlen()'d downstream (PBKDF2
+     * runs strlen(pass)) — force-terminate a local copy so a 64-byte unterminated pass
+     * can't walk kernel heap. */
+    struct rtw_connect_req rq = *req;
+    rq.ssid[sizeof(rq.ssid) - 1] = 0;
+    rq.pass[sizeof(rq.pass) - 1] = 0;
+    req = &rq;
 
     /* CRITICAL (no-IOMMU): tear down any data path / scan from a PREVIOUS connection
      * BEFORE re-running power-on. The GUI/auto-connect can issue a connect while already
@@ -335,13 +356,49 @@ void rtw_kctl_connect(const struct rtw_connect_req *req, struct rtw_connect_resu
 /* tear down the in-kernel connection — remove enX (so macOS falls back to other
  * interfaces) and release the DMA rings. A later --kconnect re-runs the full bring-up
  * (it re-enables bus-mastering, which trx_free turns off). */
+extern int trx_tx_mgmt(struct rtw_dev *rtwdev, const unsigned char *frame, unsigned int len,
+                       unsigned char rate, int bmc);
+
 void rtw_kctl_disconnect(void)
 {
+    /* Tell the AP we are leaving (deauth, reason 3 "STA is leaving") BEFORE tearing the
+     * rings down, so it frees our association state instead of retrying a dead peer
+     * until its inactivity timer fires. Uses the MGMT ring, which the in-kext data path
+     * does not touch, so it is safe while the data path is still up. Best-effort. */
+    if (g_cur_connected && g_kmmio) {
+        unsigned char f[26];
+        f[0] = 0xc0; f[1] = 0x00;                 /* mgmt / deauthentication */
+        f[2] = 0;    f[3] = 0;                    /* duration */
+        memcpy(f + 4,  g_cur_bssid, 6);           /* addr1 = AP   */
+        memcpy(f + 10, g_cur_mac,   6);           /* addr2 = us   */
+        memcpy(f + 16, g_cur_bssid, 6);           /* addr3 = BSSID */
+        f[22] = 0; f[23] = 0;                     /* seq (HW fills) */
+        f[24] = 3; f[25] = 0;                     /* reason 3: deauth, leaving */
+        struct rtw_dev d;
+        kdev_init(&d);
+        trx_tx_mgmt(&d, f, sizeof(f), g_cur_channel > 14 ? 0x04 /*6M*/ : 0x00 /*1M*/, 0);
+        usleep_range(20000, 20000);               /* let it air out before halting DMA */
+    }
     hw_data_stop();   /* remove enX + stop the RX thread */
     trx_free();       /* halt TRX DMA, disable bus-mastering, free the rings */
     g_cur_connected = 0;
     g_cur_ssid[0] = 0;
     IOLog("RTW88 kctl: disconnected — enX removed, rings freed\n");
+}
+
+/* clear all in-kernel control state. Called from RTW88Server::stop() because the
+ * kctl statics outlive a single device instance (the kext stays loaded across a
+ * provider stop()/start() re-probe): a stale g_cur_connected would make status
+ * report a phantom connection and let the next disconnect deauth through freed
+ * trx buffers. */
+void rtw_kctl_unload_reset(void)
+{
+    g_cur_connected = 0;
+    g_cur_ssid[0] = 0;
+    memset(g_cur_bssid, 0, sizeof(g_cur_bssid));
+    memset(g_cur_mac, 0, sizeof(g_cur_mac));
+    g_cur_channel = 0;
+    g_scan_active = 0;
 }
 
 /* report the live connection state (set by the last connect, cleared by

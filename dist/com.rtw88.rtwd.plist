@@ -5,12 +5,11 @@
 	<key>Label</key>
 	<string>com.rtw88.rtwd</string>
 
-	<!-- rtwd: the HeliPort-style control daemon. Runs as root (needs the RTW88Server
-	     user client + ipconfig for DHCP) and exposes scan/connect/disconnect/status
-	     over /var/run/rtw88d.sock for the unprivileged menu-bar app to drive.
-
-	     NOTE: install this INSTEAD of com.rtw88.client.plist if you want to drive
-	     Wi-Fi from the GUI rather than auto-connecting to a config file at boot. -->
+	<!-- rtwd: the control daemon — the ONLY process that talks to the kext.
+	     Runs as root (needs the RTW88Server user client + ipconfig for DHCP),
+	     auto-connects to the strongest saved network from /usr/local/etc/rtw88.conf,
+	     and exposes scan/connect/disconnect/status over /var/run/rtw88d.sock for
+	     the menu-bar app and the `rtwd <command>` CLI. -->
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/local/bin/rtwd</string>

@@ -19,6 +19,11 @@
 
 struct wifi_session g_session = { 0, 0, RTW_RATEID_G, DESC_RATE54M };
 
+/* receive-identity registers (upstream programs these at interface-add). REG_RRSR comes
+ * from reg.h; the two port-0 address registers live in upstream rtw8821c.h. */
+#define REG_MACID  0x0610   /* port-0 self-MAC: WMAC auto-ACKs unicast whose RA == this */
+#define REG_BSSID  0x0618   /* port-0 BSSID hardware filter */
+
 void set_channel(struct rtw_dev *rtwdev, u8 channel, u8 bw, u8 primary_ch_idx);
 void rtw_do_iqk(struct rtw_dev *rtwdev);   /* phy.c — firmware I/Q calibration */
 int  wpa_handshake(struct rtw_dev *rtwdev, const u8 *bssid,
@@ -137,18 +142,23 @@ static int wait_mgmt_resp(struct rtw_dev *rtwdev, const u8 *bssid, u8 want,
             if (buf) {
                 u32 w0 = *(u32 *)buf;
                 u32 pkt_len = w0 & 0x3fff, drv = (w0 >> 16) & 0xf, shift = (w0 >> 24) & 0x3;
-                if (pkt_len >= 28 && pkt_len <= 2048) {
+                /* skip HW-flagged CRC32/ICV-error frames (W0 bits 14/15) — a corrupt
+                 * auth/assoc response must not be parsed as a valid status */
+                if ((w0 & (BIT(14) | BIT(15))) == 0 && pkt_len >= 30 && pkt_len <= 2048) {
                     u8 *f = buf + 24 + shift + drv * 8;
                     u16 fc = (u16)(f[0] | (f[1] << 8));
                     u8 type = (fc >> 2) & 0x3, sub = (fc >> 4) & 0xf;
                     if (type == 0 && sub == want && memcmp(f + 16, bssid, 6) == 0) {
                         u32 blen = pkt_len - 24;
                         if (blen > *body_len) blen = *body_len;
-                        memcpy(body, f + 24, blen);
-                        *body_len = blen;
-                        rp = (rp + 1) % n;
-                        trx_rx_set_host_idx(rtwdev, rp);
-                        return 1;
+                        /* both callers parse 3 fixed u16 fields — require them present */
+                        if (blen >= 6) {
+                            memcpy(body, f + 24, blen);
+                            *body_len = blen;
+                            rp = (rp + 1) % n;
+                            trx_rx_set_host_idx(rtwdev, rp);
+                            return 1;
+                        }
                     }
                 }
             }
@@ -178,7 +188,8 @@ static void listen_eapol(struct rtw_dev *rtwdev, const u8 *bssid)
             if (buf) {
                 u32 w0 = *(u32 *)buf;
                 u32 pkt_len = w0 & 0x3fff, drv = (w0 >> 16) & 0xf, shift = (w0 >> 24) & 0x3;
-                if (pkt_len >= 32 && pkt_len <= 2048) {
+                if ((w0 & (BIT(14) | BIT(15))) == 0 &&   /* skip CRC32/ICV-error frames */
+                    pkt_len >= 32 && pkt_len <= 2048) {
                     u8 *f = buf + 24 + shift + drv * 8;
                     u16 fc = (u16)(f[0] | (f[1] << 8));
                     u8 type = (fc >> 2) & 0x3, sub = (fc >> 4) & 0xf;
@@ -217,6 +228,23 @@ int associate(struct rtw_dev *rtwdev, const u8 *bssid,
     printf("\n=== associate to \"%s\" %02x:%02x:%02x:%02x:%02x:%02x ch %u ===\n",
            ssid, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel);
     set_channel(rtwdev, channel, RTW_CHANNEL_WIDTH_20, 0);
+
+    /* Program our receive identity BEFORE the exchange (upstream does this at interface-add,
+     * not post-handshake). The WMAC auto-ACKs a received unicast only when its RA matches
+     * REG_MACID (gated by RCR APM, already set in macinit). With REG_MACID still zero during
+     * AUTH/ASSOC/the 4-way, the AP gets no ACK for the EAPOL frames it sends us and MAC-
+     * retransmits each one; on slow 2.4GHz 1M-CCK that duplicate storm stalls the handshake
+     * (associates but never completes -> no DHCP/IP), while faster 5GHz/6M tends to squeak
+     * through. REG_BSSID keeps the hardware filter on our AP; REG_RRSR sets the basic-rate
+     * set the WMAC uses for the ACKs it generates. media_connect re-affirms these post-join. */
+    {
+        const u8 *a = rtwdev->efuse.addr;
+        hw_write32(REG_MACID, a[0] | ((u32)a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24));
+        hw_write16(REG_MACID + 4, a[4] | ((u32)a[5] << 8));
+        hw_write32(REG_BSSID, bssid[0] | ((u32)bssid[1] << 8) | ((u32)bssid[2] << 16) | ((u32)bssid[3] << 24));
+        hw_write16(REG_BSSID + 4, bssid[4] | ((u32)bssid[5] << 8));
+        hw_write32(REG_RRSR, five ? 0x150 : 0x15f);
+    }
 
     /* IQK on the tuned channel before auth: uncalibrated I/Q imbalance silently drops a
      * large fraction of RX frames. 5GHz-only for now (the firmware IQK coincided with a

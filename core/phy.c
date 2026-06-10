@@ -63,18 +63,29 @@ bool rtw_write_rf(struct rtw_dev *rtwdev, enum rtw_rf_path rf_path, u32 addr, u3
  * otherwise corrupts a fraction of received symbols (silent FCS failures, err=0, after
  * which the AP rate-floors the downlink). Run on the connection channel once it's tuned.
  *
- * KNOWN LIMITATION (see KNOWN_ISSUES.md): on this port the firmware does NOT execute the
- * IQK. It receives a byte-perfect IQK H2C — verified on hardware against upstream rtw88:
- * identical packet format, identical H2C-ring delivery, firmware v24.11 which supports
- * IQK — yet never writes the 0xABCDE sentinel (RF 0x08 stays at its 0x9c060 reset value).
- * Every driver-side cause was eliminated step by step (completion mechanism, packet
- * format, H2C Last-Segment bit, the RFK-inform wrap, the poll window, the RF read path).
- * The remaining gap is a firmware bring-up precondition upstream establishes that this
- * port does not. RX therefore runs UNCALIBRATED — tolerable at 20MHz HT (the link works,
- * ~40 Mbps) but the suspected blocker for 40MHz. The code below matches upstream
- * rtw8821c_do_iqk, so it will work once the precondition is found (capture a live rtw88
- * H2C/register trace around phy_calibration on this hardware and diff). Non-fatal. */
+ * KNOWN LIMITATION: on this port the firmware consumes the IQK H2C but never writes the
+ * 0xABCDE sentinel (RF 0x08 stays at its 0x9c060 reset value), so RX runs UNCALIBRATED.
+ * The 32-byte IQK PACKET is byte-identical to upstream rtw_fw_do_iqk (verified by macro
+ * expansion: category 0x01 | cmd 0xFF | sub_id 0x0E, total_len 9, seq in word1[31:16],
+ * clear/segment 0 pre-assoc) — the bug is NOT in the payload. The remaining code-verified
+ * divergences, in order of suspicion, are: (1) the H2C TX *descriptor* sets OFFSET=48/LS=1
+ * where upstream's PCIe H2C path sets both 0 (trx.c trx_tx_h2c) — but note the SAME
+ * descriptor delivers general_info/phydm_info, which the link appears to need, so the
+ * decisive test is whether the MCU drains the H2C FIFO at all; (2) no coex bring-up — on
+ * this BT-combo chip upstream's fw RFK arbitrates against BT (REG_ARFR4 BIT_WL_RFK vs the
+ * 0xAA scoreboard), and the port writes neither the scoreboard nor any coex H2C and forces
+ * GNT_BT SW-LOW; (3) phydm_info carried cut_version=0 instead of the real silicon cut.
+ * The instrumentation below reads the firmware-side H2C FIFO pointers and the WL-RFK flag
+ * so the next boot can tell "MCU never parsed it" (descriptor) from "parsed but refused to
+ * calibrate" (coex/precondition). Non-fatal on timeout. */
 extern int trx_tx_h2c(struct rtw_dev *rtwdev, const u8 *pkt);
+
+/* firmware-visible H2C/calibration state — register defs come from core/upstream/reg.h:
+ *   REG_H2C_PKT_READADDR/WRITEADDR — the MCU's own H2C-FIFO byte pointers (not the PCIe
+ *     TXBD ring index at 0x132C). READADDR advancing == the MCU drained/parsed the packet.
+ *   REG_ARFR4 BIT_WL_RFK — fw sets this while it is running WL RF calibration.
+ *   REG_WIFI_BT_INFO (0xAA, 16-bit) — the WL/BT coex scoreboard. Read aligned at 0xA8. */
+#define REG_WIFI_BT_INFO_AL    0x00A8   /* aligned base; scoreboard 0xAA is the high half */
 
 void rtw_do_iqk(struct rtw_dev *rtwdev)
 {
@@ -88,19 +99,29 @@ void rtw_do_iqk(struct rtw_dev *rtwdev)
     w[0] = 0x01u | (0xFFu << 8) | (0x0Eu << 16);
     w[1] = 9u | ((u32)seq++ << 16);
     w[2] = 0;
+
+    /* pre-send firmware-side snapshot (read-only) */
+    u32 rd0 = hw_read32(REG_H2C_PKT_READADDR)  & 0x3FFFF;
+    u32 wr0 = hw_read32(REG_H2C_PKT_WRITEADDR) & 0x3FFFF;
+    u32 rfk0 = hw_read32(REG_ARFR4) & BIT_WL_RFK;
+    u32 scbd = hw_read32(REG_WIFI_BT_INFO_AL) >> 16;
+
     trx_tx_h2c(rtwdev, pkt);
 
-    int done = 0, i;
+    int done = 0, rfk_seen = 0, i;
     for (i = 0; i < 300; i++) {          /* ~6s, matching upstream rtw8821c_do_iqk's 300 x 20ms */
+        if (!rfk_seen && (hw_read32(REG_ARFR4) & BIT_WL_RFK)) rfk_seen = 1;
         if (rtw_phy_read_rf(rtwdev, RF_PATH_A, 0x08, RFREG_MASK) == 0xabcde) { done = 1; break; }
         usleep_range(20000, 20000);
     }
+    u32 rd1 = hw_read32(REG_H2C_PKT_READADDR)  & 0x3FFFF;
+    u32 wr1 = hw_read32(REG_H2C_PKT_WRITEADDR) & 0x3FFFF;
     rtw_write_rf(rtwdev, RF_PATH_A, 0x08, RFREG_MASK, 0x0);
-    /* REG_IQKFAILMSK (0x1bf0) [7:0] = per-path fail mask. On a timeout, failmask==0 means
-     * the firmware never ran the calibration (the known limitation documented above). */
-    rtw_info(rtwdev, "  IQK %s (failmask=0x%02x)",
+    /* REG_IQKFAILMSK (0x1bf0) [7:0] = per-path fail mask. The h2cfifo rd delta tells whether
+     * the MCU parsed the packet at all; wl_rfk[seen] tells whether the fw started calibration. */
+    rtw_info(rtwdev, "  IQK %s failmask=0x%02x  h2cfifo[rd %05x->%05x wr %05x->%05x] wl_rfk[pre=%u seen=%u] scbd=0x%04x",
              done ? "done — calibrated" : "TIMEOUT — fw did not run IQK (uncalibrated)",
-             hw_read32(0x1bf0) & 0xffu);
+             hw_read32(0x1bf0) & 0xffu, rd0, rd1, wr0, wr1, rfk0, rfk_seen, scbd);
 }
 
 /* ---- cfg appliers (phy.c, verbatim) ------------------------------------- */
@@ -264,6 +285,14 @@ int phy_set_param(struct rtw_dev *rtwdev)
 
     /* post init after header files config */
     rtw_write32_set(rtwdev, REG_RXPSEL, BIT_RX_PSEL_RST);
+
+    /* Latch the real silicon cut (REG_SYS_CFG1[15:12]) for the phydm_info H2C that
+     * fw_handshake sends next. The port previously shipped cut_version=0 (A-cut) to the
+     * firmware regardless of silicon; upstream sends the real cut (rtw_read_chip_version),
+     * and fw PHYDM — which owns the fw IQK — is configured from it. Set HERE (after the
+     * BB/AGC/MAC table load) so the validated table-load path, which also reads cut_version
+     * via the phy_cond engine, is left exactly as-is; only the phydm_info byte changes. */
+    rtwdev->hal.cut_version = BIT_GET_CHIP_VER(rtw_read32(rtwdev, REG_SYS_CFG1));
 
     /* correctness: cond engine matched + RF responds (reg 0x00 not 0/0xfffff) */
     int rf_alive = (rf0_after != 0 && rf0_after != 0xfffff);

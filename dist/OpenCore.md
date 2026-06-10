@@ -1,16 +1,15 @@
 # RTW88 on OpenCore — boot setup for auto-connect WiFi
 
 This makes the RTL8821CE come up and connect to your WiFi automatically on every
-boot: OpenCore injects the **RTW88Server** kext (the driver), and a LaunchDaemon
-starts **RTW88Client** which tells it to join your known networks — routing the
-whole system through the card.
+boot: OpenCore injects the **RTW88Server** kext (the driver), and the **rtwd**
+LaunchDaemon joins your saved networks — routing the whole system through the card.
 
 Two moving parts:
 
 | Part | What it is | Loaded by |
 |------|------------|-----------|
 | `RTW88Server.kext` | the driver: maps the card's MMIO, owns DMA, and runs the full 802.11 stack in-kernel (power/fw/PHY/scan/assoc/WPA2/CCMP + TX-RX) behind a macOS `enX` + a control user-client | OpenCore (or `/Library/Extensions`) |
-| `RTW88Client` | a thin control utility: tells the kext to scan/connect and brings `enX` online (configd DHCP) | a LaunchDaemon at boot |
+| `rtwd` | the control daemon + CLI: tells the kext to scan/connect, brings `enX` online (configd DHCP), auto-reconnects, and serves the menu-bar app / CLI | a LaunchDaemon at boot |
 
 ---
 
@@ -54,7 +53,7 @@ cp -R dist/RTW88Server.kext /Volumes/EFI/EFI/OC/Kexts/
 <dict>
     <key>Arch</key>            <string>x86_64</string>
     <key>BundlePath</key>      <string>RTW88Server.kext</string>
-    <key>Comment</key>         <string>RTL8821CE PCI bridge</string>
+    <key>Comment</key>         <string>RTL8821CE WiFi driver</string>
     <key>Enabled</key>         <true/>
     <key>ExecutablePath</key>  <string>Contents/MacOS/RTW88Server</string>
     <key>MaxKernel</key>       <string></string>
@@ -66,7 +65,7 @@ cp -R dist/RTW88Server.kext /Volumes/EFI/EFI/OC/Kexts/
 Reboot. Verify it matched the card:
 
 ```sh
-ioreg -c RTW88Server | grep -i rtw88        # should list the service
+ioreg -c RTW88Server | grep -i rtw88         # should list the service
 kextstat | grep rtw88                        # com.rtw88.RTW88Server loaded
 ```
 
@@ -77,43 +76,45 @@ kextstat | grep rtw88                        # com.rtw88.RTW88Server loaded
 
 ---
 
-## 3. Install the client + auto-connect service
+## 3. Install the daemon (+ optional menu-bar app)
 
 ```sh
-sudo bash dist/install.sh
+sudo bash dist/install.sh           # daemon + CLI
+sudo bash dist/install.sh --gui     # ... plus the menu-bar app
 ```
 
-This builds/installs `RTW88Client` to `/usr/local/bin`, the netcfg helper to
-`/usr/local/libexec`, a config file to `/usr/local/etc/rtw88.conf`, and the
-LaunchDaemon `com.rtw88.client` to `/Library/LaunchDaemons`.
+This installs `rtwd` to `/usr/local/bin`, the netcfg helper to
+`/usr/local/libexec`, a config file to `/usr/local/etc/rtw88.conf` (0600), and
+the LaunchDaemon `com.rtw88.rtwd` (started immediately).
 
-Edit your network(s) — you can list several and it joins whichever is in range:
+Join a network once — its password is saved and reused on every boot:
+
+```sh
+rtwd connect "MyHomeWiFi" "home-pass"
+```
+
+or pre-list several networks in `/usr/local/etc/rtw88.conf` (it joins whichever
+is strongest in range):
 
 ```ini
-# /usr/local/etc/rtw88.conf
 network  = MyHomeWiFi
 password = home-pass
 network  = Phone Hotspot
 password = hotspot-pass
 band     = both
-mode     = eth         # join + macOS enX, full system connectivity
 ```
 
-Start it now (or just reboot — it auto-starts):
-
-```sh
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.rtw88.client.plist
-tail -f /var/log/rtw88.log
-```
-
-Within a few seconds you should have a default route + DNS through the card —
-`ping 8.8.8.8`, `curl https://example.com`, and Safari all work.
+Within a few seconds of boot you should have a default route + DNS through the
+card — `ping 8.8.8.8`, `curl https://example.com`, and Safari all work.
 
 To stop / disable:
 
 ```sh
-sudo launchctl bootout system/com.rtw88.client
+sudo launchctl bootout system/com.rtw88.rtwd
 ```
+
+To remove everything: `sudo bash dist/uninstall.sh` (plus delete the kext from
+`EFI/OC/Kexts` and its `config.plist` entry if you injected it via OpenCore).
 
 ---
 
@@ -121,10 +122,10 @@ sudo launchctl bootout system/com.rtw88.client
 
 - **`RTW88Server not found`** — the kext didn't load: check step 0 (boot-arg +
   quirk), that the card is an RTL8821CE (`0xc82110ec`), and `kextstat | grep rtw88`.
-- **Connects but no internet** — confirm `mode = eth`; check `/var/log/rtw88.log`
-  for the enX/DHCP line. `ifconfig` should show the kext's `enX` with a leased IP,
-  and `route -n get 8.8.8.8` should go via it.
-- **Wrong/!no network joined** — the SSID in `rtw88.conf` must match exactly
-  (case-sensitive); run `RTW88Client --mode scan` to see what's visible.
-- It is normal to see the link renegotiate if you roam; the LaunchDaemon
-  restarts the client and it rejoins the strongest known network.
+- **Connects but no internet** — check `/var/log/rtw88d.log` for the enX/DHCP
+  line. `ifconfig` should show the kext's `enX` with a leased IP, and
+  `route -n get 8.8.8.8` should go via it.
+- **Wrong/no network joined** — the SSID in `rtw88.conf` must match exactly
+  (case-sensitive); run `rtwd scan` to see what's visible.
+- It is normal to see the link renegotiate if you roam; rtwd's auto-connect
+  rejoins the strongest known network after a drop.

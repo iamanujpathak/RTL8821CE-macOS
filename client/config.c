@@ -1,22 +1,16 @@
 /*
- * config.c — CLI + config-file parsing for RTW88Client.
+ * config.c — rtw88.conf parsing + persistence for the rtwd daemon.
  *
- *   RTW88Client [options]
- *     --config <file>    read settings from a file first (CLI flags override)
- *     --ssid <name>      add a known network (repeatable)
- *     --password <pass>  passphrase for the most recent --ssid (omit = open)
- *     --band 2.4|5|both  band(s) to scan                       (default both)
- *     --mode eth|scan    eth=join + macOS enX (default if a network
- *                        is configured), scan=list networks only
- *     --ip/--netmask/--gateway/--dns   static-IP overrides (optional; else DHCP)
- *     --help
- *
- * Config file: `key = value` per line, '#' starts a comment. Multiple networks:
- * each `network = <ssid>` (or `ssid = <ssid>`) starts an entry and the following
- * `password = <pass>` applies to it — list as many as you like:
+ * Config file: `key = value` per line; a line whose first non-blank character is
+ * '#' is a comment. '#' is NOT a comment inside a value, so a WPA2 passphrase may
+ * contain '#' and interior spaces and round-trips through save/load unchanged.
+ * (LEADING/TRAILING whitespace in a value is trimmed — a passphrase that begins or
+ * ends with a space is not preserved; such passphrases are pathological and the GUI
+ * cannot enter them either.)
+ * Multiple networks: each `network = <ssid>` (or `ssid = <ssid>`) starts an entry
+ * and the following `password = <pass>` applies to it — list as many as you like:
  *
  *     band = 5
- *     mode = eth
  *     network = HomeWiFi
  *     password = homesecret
  *     network = Phone Hotspot
@@ -26,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include "config.h"
@@ -60,6 +56,17 @@ static void trim(char *s)
     if (p != s) memmove(s, p, strlen(p) + 1);
     size_t n = strlen(s);
     while (n && (s[n-1]=='\n' || s[n-1]=='\r' || s[n-1]==' ' || s[n-1]=='\t')) s[--n] = 0;
+}
+
+/* strip a WHOLE-LINE comment only: a '#' as the first non-blank character makes the
+ * line a comment. We deliberately do NOT honor inline trailing '#' comments, so a
+ * value (SSID or WPA2 passphrase) may contain '#' and any spaces and still round-trips
+ * through config_save/load unchanged. */
+static void strip_comment(char *line)
+{
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '#') line[0] = 0;
 }
 
 static int parse_band(const char *v)
@@ -101,6 +108,12 @@ static int apply(const char *key, const char *val)
     return 0;
 }
 
+/* does this key's value contain a secret? (keeps it out of error logs) */
+static int key_is_secret(const char *key)
+{
+    return strcasestr(key, "pass") != NULL;
+}
+
 static int load_file(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -108,7 +121,7 @@ static int load_file(const char *path)
     char line[512]; int lineno = 0;
     while (fgets(line, sizeof line, f)) {
         lineno++;
-        char *h = strchr(line, '#'); if (h) *h = 0;
+        strip_comment(line);
         char *eq = strchr(line, '=');
         if (!eq) continue;
         *eq = 0;
@@ -117,16 +130,17 @@ static int load_file(const char *path)
         strncpy(val, eq + 1, sizeof val - 1); val[sizeof val-1]=0; trim(val);
         if (!key[0]) continue;
         if (apply(key, val) != 0)
-            fprintf(stderr, "config: %s:%d: bad setting '%s = %s'\n", path, lineno, key, val);
+            fprintf(stderr, "config: %s:%d: bad setting '%s = %s'\n", path, lineno, key,
+                    key_is_secret(key) ? "********" : val);
     }
     fclose(f);
     return 0;
 }
 
-/* ---- runtime config persistence (used by rtwd to remember networks) -------- */
+/* ---- runtime config persistence (rtwd remembers networks) ------------------ */
 
-/* Public load entry (rtwd has no argv to pass to parse_args). Missing file is
- * fine — start with an empty known-network list. Returns 0 always. */
+/* Public load entry. Missing file is fine — start with an empty known-network
+ * list. Returns 0 always. */
 int config_load_file(const char *path)
 {
     load_file(path);   /* logs + returns -1 if absent; we treat that as "no saved nets" */
@@ -163,13 +177,18 @@ static const char *band_str(int b)
 static void ip_str(unsigned v, char *out, size_t cap)
 { struct in_addr a; a.s_addr = htonl(v); strncpy(out, inet_ntoa(a), cap - 1); out[cap - 1] = 0; }
 
-/* Rewrite the config file from g_cfg (networks + band/mode/static IP). Loses the
- * example file's comments, but is idempotent and machine-writable; 0600 since it
- * holds passphrases. Returns 0 on success, -1 if the file can't be written. */
+/* Rewrite the config file from g_cfg (networks + band/static IP). Written to a
+ * temp file created 0600 (it holds passphrases — never visible with looser
+ * modes, even briefly) and renamed into place so a crash mid-write can't leave
+ * a truncated config. Loses the example file's comments; idempotent. */
 int config_save(const char *path)
 {
-    FILE *f = fopen(path, "w");
-    if (!f) { fprintf(stderr, "config: cannot write %s\n", path); return -1; }
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { fprintf(stderr, "config: cannot write %s\n", tmp); return -1; }
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp); return -1; }
     fprintf(f, "# rtw88.conf — written by rtwd. `key = value`; '#' starts a comment.\n");
     fprintf(f, "# Known networks (each 'network =' starts an entry; 'password =' is its key).\n\n");
     for (int i = 0; i < g_cfg.n_nets; i++) {
@@ -179,7 +198,6 @@ int config_save(const char *path)
         fprintf(f, "\n");
     }
     fprintf(f, "band = %s\n", band_str(g_cfg.band));
-    fprintf(f, "mode = %s\n", g_cfg.mode == MODE_SCAN ? "scan" : "eth");
     if (g_cfg.ip || g_cfg.netmask || g_cfg.gateway || g_cfg.dns) {
         char b[16];
         if (g_cfg.ip)      { ip_str(g_cfg.ip, b, sizeof b);      fprintf(f, "ip      = %s\n", b); }
@@ -187,61 +205,10 @@ int config_save(const char *path)
         if (g_cfg.gateway) { ip_str(g_cfg.gateway, b, sizeof b); fprintf(f, "gateway = %s\n", b); }
         if (g_cfg.dns)     { ip_str(g_cfg.dns, b, sizeof b);     fprintf(f, "dns     = %s\n", b); }
     }
-    fclose(f);
-    chmod(path, 0600);
-    return 0;
-}
-
-static void usage(const char *argv0)
-{
-    printf(
-"usage: %s [options]\n"
-"  --config <file>      load settings from a file (CLI flags override)\n"
-"  --ssid <name>        add a known network (repeatable)\n"
-"  --password <pass>    passphrase for the most recent --ssid (omit = open)\n"
-"  --band 2.4|5|both    band(s) to scan                    (default both)\n"
-"  --mode eth|scan      eth=join + macOS Ethernet enX        (default eth if a\n"
-"                       scan=list networks only             network is set)\n"
-"  --ip/--netmask/--gateway/--dns  static-IP overrides (optional; else DHCP)\n"
-"  --help\n"
-"\nexamples:\n"
-"  sudo %s --ssid MyWiFi --password secret --band 5 --mode eth\n"
-"  sudo %s --ssid Home --password h --ssid Phone --password p   # roams\n"
-"  sudo %s --config /usr/local/etc/rtw88.conf\n"
-"  %s --mode scan        # just list visible networks (no sudo)\n",
-        argv0, argv0, argv0, argv0, argv0);
-}
-
-int parse_args(int argc, char **argv)
-{
-    /* a config file given with --config is read first so flags can override it */
-    for (int i = 1; i < argc - 1; i++)
-        if (!strcmp(argv[i], "--config")) { if (load_file(argv[i+1]) != 0) return -1; }
-
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        #define NEXT() (i + 1 < argc ? argv[++i] : (fprintf(stderr,"%s needs a value\n",a), (const char*)NULL))
-        if (!strcmp(a,"--help")||!strcmp(a,"-h")) { usage(argv[0]); return 1; }
-        else if (!strcmp(a,"--config")) { i++; /* already handled */ }
-        else if (!strcmp(a,"--ssid")||!strcmp(a,"--network")) { const char*v=NEXT(); if(!v)return -1; apply("ssid",v); }
-        else if (!strcmp(a,"--password")||!strcmp(a,"--pass")) { const char*v=NEXT(); if(!v)return -1; if(apply("password",v)){return -1;} }
-        else if (!strcmp(a,"--band"))     { const char*v=NEXT(); if(!v)return -1; if(apply("band",v)){fprintf(stderr,"bad --band %s\n",v);return -1;} }
-        else if (!strcmp(a,"--mode"))     { const char*v=NEXT(); if(!v)return -1; if(apply("mode",v)){fprintf(stderr,"bad --mode %s\n",v);return -1;} }
-        else if (!strcmp(a,"--ip"))       { const char*v=NEXT(); if(!v)return -1; apply("ip",v); }
-        else if (!strcmp(a,"--netmask"))  { const char*v=NEXT(); if(!v)return -1; apply("netmask",v); }
-        else if (!strcmp(a,"--gateway")||!strcmp(a,"--gw")) { const char*v=NEXT(); if(!v)return -1; apply("gateway",v); }
-        else if (!strcmp(a,"--dns"))      { const char*v=NEXT(); if(!v)return -1; apply("dns",v); }
-        else if (parse_mode(a) >= 0)      { g_cfg.mode = parse_mode(a); }  /* bare token: eth|scan */
-        else { fprintf(stderr, "unknown option: %s (try --help)\n", a); return -1; }
-        #undef NEXT
-    }
-
-    /* default mode: eth (full system connectivity via enX) if we have a network, else scan */
-    if (g_cfg.mode < 0) g_cfg.mode = g_cfg.n_nets ? MODE_ETH : MODE_SCAN;
-
-    if (g_cfg.mode != MODE_SCAN && g_cfg.n_nets == 0) {
-        fprintf(stderr, "error: at least one --ssid (or 'network =' in the config) "
-                        "is required for --mode eth\n");
+    if (fclose(f) != 0) { unlink(tmp); return -1; }
+    if (rename(tmp, path) != 0) {
+        fprintf(stderr, "config: cannot replace %s\n", path);
+        unlink(tmp);
         return -1;
     }
     return 0;

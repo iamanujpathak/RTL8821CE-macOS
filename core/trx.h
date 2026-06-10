@@ -15,6 +15,8 @@
 /* set up all TX queue BD rings + the RX BD ring and program the chip. 0 on ok. */
 int  trx_init(struct rtw_dev *rtwdev);
 void trx_free(void);
+/* clear the allocate-once bookkeeping after the kext freed the DMA buffers (stop()) */
+void trx_unload_reset(void);
 
 /* re-program DESA/NUM/RWPTR (upstream rtw_pci_reset_trx_ring). */
 void trx_reset(struct rtw_dev *rtwdev);
@@ -31,8 +33,8 @@ int  trx_write_data_rsvd_page(struct rtw_dev *rtwdev, u8 *buf, u32 size);
 int  trx_tx_mgmt(struct rtw_dev *rtwdev, const u8 *frame, u32 len, u8 rate, int bmc);
 /* send a 32-byte H2C packet to the firmware via the H2C queue */
 int  trx_tx_h2c(struct rtw_dev *rtwdev, const u8 *pkt);
-/* send an 802.11 data frame via the BE queue (EAPOL etc.); sec_type 0 = clear */
-int  trx_tx_data(struct rtw_dev *rtwdev, const u8 *frame, u32 len, u8 rate, u8 qsel, u8 sec_type);
+/* send an in-clear 802.11 data frame via the BE queue (the EAPOL handshake) */
+int  trx_tx_data(struct rtw_dev *rtwdev, const u8 *frame, u32 len, u8 rate);
 
 /* ---- RX ring access ----------------------------------------------------- */
 int  trx_rx_ok(void);            /* RX ring allocated + programmed */

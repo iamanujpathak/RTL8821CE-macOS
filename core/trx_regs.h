@@ -37,8 +37,7 @@ static inline bool check_hw_ready(struct rtw_dev *rtwdev, u32 addr, u32 mask, u3
 /* ---- pci.h: ring sizes, BD desc addrs, num/idx regs, BCN work ----------- */
 #define RTK_DEFAULT_TX_DESC_NUM 128
 #define RTK_BEQ_TX_DESC_NUM     256
-#define RTK_MAX_RX_DESC_NUM     512
-#define RTK_PCI_RX_BUF_SIZE     (11454 + 24)
+/* (RX ring depth + slot size live in trx.c: USCAN_RX_DESC_NUM / USCAN_RX_BUF_SIZE) */
 
 #define RTK_PCI_CTRL            0x300
 #define BIT_RST_TRXDMA_INTF     BIT(20)
@@ -104,7 +103,11 @@ enum rtw_tx_queue_type {
 #define RTW_TX_DESC_W3_USE_RATE  BIT(8)
 #define RTW_TX_DESC_W3_DISDATAFB BIT(10)
 #define RTW_TX_DESC_W4_DATARATE  GENMASK(6, 0)
-#define RTW_TX_DESC_W8_EN_HWSEQ  BIT(31)
+#define RTW_TX_DESC_W8_EN_HWSEQ  BIT(15)   /* upstream tx.h:60 — was BIT(31): a wrong bit
+                                            * left HW sequence numbering OFF, so every TX
+                                            * frame (mgmt/data/EAPOL) carried seq 0. Breaks
+                                            * AP de-dup (stalls the 4-way on retransmits) and
+                                            * Block-Ack reordering (downlink throughput). */
 #define TX_DESC_QSEL_BEACON      16
 #define TX_DESC_QSEL_MGMT        18
 #define TX_DESC_QSEL_H2C         19

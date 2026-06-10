@@ -25,4 +25,4 @@ chmod -R 755 "$KEXT"
 
 echo "==> kmutil load"
 kmutil load -p "$KEXT"
-echo "==> loaded. Verify:  ioreg -c RTW88Server | grep -i bridge"
+echo "==> loaded. Verify:  ioreg -c RTW88Server | grep -i rtw88"
