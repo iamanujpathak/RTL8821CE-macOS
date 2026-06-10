@@ -4,8 +4,14 @@
 // daemon `rtwd`; this app just speaks the line/JSON protocol over the Unix socket
 // at /var/run/rtw88d.sock. No private API, runs as the console user.
 //
+// Shell: AppKit NSStatusItem + NSPopover hosting a SwiftUI view. The popover is
+// anchored to the status-item button, so it positions correctly even when the
+// menu bar auto-hides in full-screen spaces (SwiftUI's MenuBarExtra .window
+// style detached/mis-positioned there).
+//
 // Build: client/gui/build-app.sh  ->  build/client/RTW88Menu.app
 
+import AppKit
 import SwiftUI
 import Darwin
 
@@ -14,13 +20,22 @@ import Darwin
 enum Rtwd {
     static let sockPath = "/var/run/rtw88d.sock"
 
-    /// Send one command line, read the full JSON reply (daemon closes after replying).
-    /// Blocking — call off the main thread.
-    static func request(_ line: String) -> [String: Any]? {
+    /// Open + connect a socket to rtwd with send/recv timeouts so a wedged
+    /// daemon can never hang a GUI thread indefinitely. The timeout must exceed a
+    /// normal connect: the daemon sends nothing until the whole chain finishes —
+    /// ~11s scan + the always-expiring 6s 5GHz IQK poll + bring-up + up-to-4s DHCP
+    /// — routinely 20-25s. 45s keeps a genuine slow join from being misreported as
+    /// "rtwd not reachable" while still bounding a truly wedged daemon.
+    private static func dial(timeoutSec: Int = 45) -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        if fd < 0 { return nil }
-        defer { close(fd) }
-
+        if fd < 0 { return -1 }
+        var tv = timeval(tv_sec: timeoutSec, tv_usec: 0)
+        _ = withUnsafePointer(to: &tv) {
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, $0, socklen_t(MemoryLayout<timeval>.size))
+        }
+        _ = withUnsafePointer(to: &tv) {
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, $0, socklen_t(MemoryLayout<timeval>.size))
+        }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let cap = MemoryLayout.size(ofValue: addr.sun_path)
@@ -33,66 +48,52 @@ enum Rtwd {
         let rc = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
         }
-        if rc != 0 { return nil }
-
-        var req = line
-        if !req.hasSuffix("\n") { req += "\n" }
-        _ = req.withCString { send(fd, $0, strlen($0), 0) }
-
-        var data = Data()
-        var buf = [UInt8](repeating: 0, count: 16384)
-        while true {
-            let n = recv(fd, &buf, buf.count, 0)
-            if n <= 0 { break }
-            data.append(contentsOf: buf[0..<n])
-        }
-        guard !data.isEmpty,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
-        return obj
+        if rc != 0 { close(fd); return -1 }
+        return fd
     }
 
     /// Send one command and invoke `onObject` for each newline-delimited JSON
-    /// object as it arrives (used by the streaming scan). Blocking — call off the
-    /// main thread. Returns once the daemon closes the connection.
-    static func stream(_ line: String, onObject: @escaping ([String: Any]) -> Void) {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        if fd < 0 { return }
+    /// object as it arrives. Lines are split on the raw 0x0A BYTE before UTF-8
+    /// decoding, so a multi-byte SSID character spanning two recv() chunks can't
+    /// corrupt a line. Blocking — call off the main thread. Returns false when
+    /// the daemon was unreachable.
+    @discardableResult
+    static func stream(_ line: String, onObject: @escaping ([String: Any]) -> Void) -> Bool {
+        let fd = dial()
+        if fd < 0 { return false }
         defer { close(fd) }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let cap = MemoryLayout.size(ofValue: addr.sun_path)
-        withUnsafeMutablePointer(to: &addr.sun_path) { raw in
-            raw.withMemoryRebound(to: CChar.self, capacity: cap) { dst in
-                _ = sockPath.withCString { strncpy(dst, $0, cap - 1) }
-            }
-        }
-        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let rc = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
-        }
-        if rc != 0 { return }
 
         var req = line
         if !req.hasSuffix("\n") { req += "\n" }
         _ = req.withCString { send(fd, $0, strlen($0), 0) }
 
-        var pending = ""
+        var pending = Data()
         var buf = [UInt8](repeating: 0, count: 16384)
+        var sawAny = false
         while true {
             let n = recv(fd, &buf, buf.count, 0)
             if n <= 0 { break }
-            pending += String(decoding: buf[0..<n], as: UTF8.self)
-            while let nl = pending.firstIndex(of: "\n") {
-                let lineStr = String(pending[pending.startIndex..<nl])
-                pending = String(pending[pending.index(after: nl)...])
-                if let d = lineStr.data(using: .utf8),
-                   let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+            pending.append(contentsOf: buf[0..<n])
+            while let nl = pending.firstIndex(of: 0x0A) {
+                let lineData = pending.subdata(in: pending.startIndex..<nl)
+                pending.removeSubrange(pending.startIndex...nl)
+                guard !lineData.isEmpty else { continue }
+                sawAny = true
+                // a single non-UTF-8 SSID must only skip ITS line, not kill the scan
+                if let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
                     onObject(obj)
                 }
             }
         }
+        return sawAny
+    }
+
+    /// Send one command, return the last JSON reply (daemon closes after replying),
+    /// or nil when the daemon was unreachable.
+    static func request(_ line: String) -> [String: Any]? {
+        var last: [String: Any]? = nil
+        let ok = stream(line) { last = $0 }
+        return ok ? (last ?? [:]) : nil
     }
 }
 
@@ -104,10 +105,11 @@ struct WifiNet: Identifiable {
     let channel: Int
     let band: String
     let beacons: Int
-    let saved: Bool          // rtwd has a stored password for this SSID
+    let secure: Bool         // beacon Privacy bit: needs a password
+    var saved: Bool          // rtwd has a stored password for this SSID
     var id: String { bssid }
-    // crude signal proxy: more beacons heard => stronger. 0..3 bars.
-    var bars: Int { beacons >= 30 ? 3 : beacons >= 12 ? 2 : beacons >= 3 ? 1 : 0 }
+    // crude signal proxy until RSSI is plumbed through the scan ABI. 0..3 bars.
+    var bars: Int { beacons >= 8 ? 3 : beacons >= 4 ? 2 : beacons >= 2 ? 1 : 0 }
 }
 
 @MainActor
@@ -120,8 +122,14 @@ final class WifiVM: ObservableObject {
     @Published var status: String = "idle"
     @Published var daemonUp: Bool = true
     @Published var powered: Bool = true
+    @Published var lastError: String? = nil   // shown inline under the affected row
+
+    /// status-item icon refresh hook (set by AppDelegate)
+    var onStateChange: (() -> Void)? = nil
 
     var connected: Bool { connectedSSID != nil }
+
+    private var scanEpoch = 0   // discard rows from a superseded scan
 
     func bg(_ work: @escaping () -> Void) {
         busy = true
@@ -134,31 +142,44 @@ final class WifiVM: ObservableObject {
     /// Streaming scan: rows appear as each channel chunk completes (rtwd emits one
     /// JSON line per network), instead of waiting for the whole ~11s sweep.
     func scan() {
-        if !powered { return }
-        busy = true; status = "scanning…"; nets = []
+        if !powered || busy { return }
+        scanEpoch += 1
+        let epoch = scanEpoch
+        busy = true; status = "scanning…"; nets = []; lastError = nil
         DispatchQueue.global().async {
             var found: [WifiNet] = []
-            Rtwd.stream("scan") { obj in
+            let ok = Rtwd.stream("scan") { obj in
                 if let net = obj["network"] as? [String: Any] {
                     let w = WifiNet(ssid: net["ssid"] as? String ?? "",
                                     bssid: net["bssid"] as? String ?? "",
                                     channel: net["channel"] as? Int ?? 0,
                                     band: net["band"] as? String ?? "",
                                     beacons: net["beacons"] as? Int ?? 0,
+                                    secure: net["secure"] as? Bool ?? true,
                                     saved: net["saved"] as? Bool ?? false)
                     if w.ssid.isEmpty || found.contains(where: { $0.bssid == w.bssid }) { return }
                     found.append(w)
                     let snap = found.sorted { $0.beacons > $1.beacons }
-                    DispatchQueue.main.async { self.daemonUp = true; self.nets = snap; self.status = "\(snap.count) networks…" }
+                    DispatchQueue.main.async {
+                        guard epoch == self.scanEpoch else { return }
+                        self.daemonUp = true; self.nets = snap; self.status = "\(snap.count) networks…"
+                    }
                 } else if (obj["done"] as? Bool) == true {
-                    DispatchQueue.main.async { self.daemonUp = true; self.status = "\(found.count) networks" }
+                    DispatchQueue.main.async {
+                        guard epoch == self.scanEpoch else { return }
+                        self.daemonUp = true; self.status = "\(found.count) networks"
+                    }
                 } else if let err = obj["error"] as? String {
-                    DispatchQueue.main.async { self.status = err }
+                    DispatchQueue.main.async {
+                        guard epoch == self.scanEpoch else { return }
+                        self.status = err
+                    }
                 }
             }
             DispatchQueue.main.async {
+                guard epoch == self.scanEpoch else { return }
                 self.busy = false
-                if found.isEmpty && self.daemonUp == false { self.status = "rtwd not reachable" }
+                if !ok { self.daemonUp = false; self.status = "rtwd not reachable" }
             }
         }
     }
@@ -166,31 +187,53 @@ final class WifiVM: ObservableObject {
     func setPower(_ on: Bool) {
         status = on ? "powering on…" : "powering off…"
         bg {
-            _ = Rtwd.request("power\t\(on ? "on" : "off")")
+            let r = Rtwd.request("power\t\(on ? "on" : "off")")
             DispatchQueue.main.async {
-                self.powered = on
-                if !on { self.connectedSSID = nil; self.ifname = ""; self.ip = ""; self.nets = [] }
-                self.status = on ? "radio on" : "radio off"
+                guard let r else { self.daemonUp = false; self.status = "rtwd not reachable"; return }
+                if (r["ok"] as? Bool) == true {
+                    self.powered = on
+                    if !on { self.connectedSSID = nil; self.ifname = ""; self.ip = ""; self.nets = [] }
+                    self.status = on ? "radio on" : "radio off"
+                } else {
+                    self.status = (r["error"] as? String) ?? "power change failed"
+                }
+                self.onStateChange?()
             }
             if on { self.fetchStatus() }
         }
     }
 
-    func connect(_ ssid: String, _ pass: String) {
-        status = "connecting to \(ssid)…"
+    /// args must not carry protocol separators (an SSID is attacker-named).
+    private static func protocolSafe(_ s: String) -> Bool {
+        !s.contains("\t") && !s.contains("\n") && !s.contains("\r")
+    }
+
+    func connect(_ ssid: String, _ pass: String, remember: Bool = true) {
+        guard WifiVM.protocolSafe(ssid), WifiVM.protocolSafe(pass) else {
+            lastError = "name/password contains an unsupported character"
+            return
+        }
+        status = "connecting to \(ssid)…"; lastError = nil
         bg {
-            // TAB-separated: connect <ssid> <pass>
-            let r = Rtwd.request("connect\t\(ssid)\t\(pass)")
+            // TAB-separated: connect <ssid> <pass> [nosave]
+            let r = Rtwd.request("connect\t\(ssid)\t\(pass)" + (remember ? "" : "\tnosave"))
             DispatchQueue.main.async {
-                guard let r else { self.status = "rtwd not reachable"; return }
+                guard let r else { self.daemonUp = false; self.status = "rtwd not reachable"; return }
                 if (r["ok"] as? Bool) == true {
                     self.connectedSSID = ssid
                     self.ifname = r["ifname"] as? String ?? ""
                     self.status = "connected (\(self.ifname))"
+                    self.lastError = nil
+                    if remember, let i = self.nets.firstIndex(where: { $0.ssid == ssid }) {
+                        self.nets[i].saved = true
+                    }
                     self.refreshStatus()
                 } else {
-                    self.status = (r["error"] as? String) ?? "connect failed"
+                    let err = (r["error"] as? String) ?? "connect failed"
+                    self.status = err
+                    self.lastError = err      // surfaced inline; the password is kept
                 }
+                self.onStateChange?()
             }
         }
     }
@@ -198,10 +241,35 @@ final class WifiVM: ObservableObject {
     func disconnect() {
         status = "disconnecting…"
         bg {
-            _ = Rtwd.request("disconnect")
+            let r = Rtwd.request("disconnect")
             DispatchQueue.main.async {
-                self.connectedSSID = nil; self.ifname = ""; self.ip = ""
-                self.status = "disconnected"
+                guard let r else { self.daemonUp = false; self.status = "rtwd not reachable"; return }
+                if (r["ok"] as? Bool) == true {
+                    self.connectedSSID = nil; self.ifname = ""; self.ip = ""
+                    self.status = "disconnected"
+                } else {
+                    self.status = (r["error"] as? String) ?? "disconnect failed"
+                }
+                self.onStateChange?()
+            }
+        }
+    }
+
+    func forget(_ ssid: String) {
+        guard WifiVM.protocolSafe(ssid) else { return }
+        bg {
+            let r = Rtwd.request("forget\t\(ssid)")
+            DispatchQueue.main.async {
+                guard let r else { self.daemonUp = false; return }
+                if (r["ok"] as? Bool) == true {
+                    // update rows in place — no need to burn a full off-channel scan
+                    for i in self.nets.indices where self.nets[i].ssid == ssid {
+                        self.nets[i].saved = false
+                    }
+                    self.status = "forgot \(ssid)"
+                } else {
+                    self.status = (r["error"] as? String) ?? "forget failed"
+                }
             }
         }
     }
@@ -211,10 +279,10 @@ final class WifiVM: ObservableObject {
     /// Quiet status fetch (no busy spinner) — used by the background poll so the
     /// menu reflects connections made via the CLI or rtwd's auto-connect. Runs off
     /// the main actor (blocking socket I/O); UI updates hop back to main below.
-    nonisolated private func fetchStatus() {
+    nonisolated func fetchStatus() {
         let r = Rtwd.request("status")
         DispatchQueue.main.async {
-            guard let r else { self.daemonUp = false; return }
+            guard let r else { self.daemonUp = false; self.onStateChange?(); return }
             self.daemonUp = true
             self.powered = (r["powered"] as? Bool) ?? true
             if (r["connected"] as? Bool) == true {
@@ -224,24 +292,26 @@ final class WifiVM: ObservableObject {
             } else {
                 self.connectedSSID = nil; self.ifname = ""; self.ip = ""
             }
+            self.onStateChange?()
         }
     }
 
     private var pollTimer: Timer?
-    /// Poll the daemon every few seconds so the GUI stays in sync with the kext
-    /// (the source of truth) regardless of who initiated the connection.
+    /// Poll the daemon every few seconds so the GUI (and the status-bar icon)
+    /// stays in sync with the kext regardless of who initiated the connection.
+    /// Started once at app launch — NOT on first popover open, or the icon shows
+    /// a stale state until the user clicks it.
     func startPolling() {
         if pollTimer != nil { return }
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { _ in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
             DispatchQueue.global().async { self.fetchStatus() }
         }
     }
 
-    func forget(_ ssid: String) {
-        bg {
-            _ = Rtwd.request("forget\t\(ssid)")
-            DispatchQueue.main.async { self.scan() }
-        }
+    func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
     }
 }
 
@@ -250,28 +320,49 @@ final class WifiVM: ObservableObject {
 struct NetRow: View {
     let net: WifiNet
     let isCurrent: Bool
-    let onTap: () -> Void
+    let isExpanded: Bool      // password panel open below (secure + unsaved only)
+    let busy: Bool
+    let onConnect: () -> Void // saved -> connect now; secure+unsaved -> toggle password panel
+    let onForget: () -> Void
+
+    /// open + unsaved networks aren't joinable yet (CCMP-only in-kext path)
+    var joinable: Bool { net.secure || net.saved }
+
     var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 8) {
-                Image(systemName: isCurrent ? "checkmark.circle.fill" : "wifi")
-                    .foregroundColor(isCurrent ? .green : .primary)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(net.ssid).fontWeight(isCurrent ? .semibold : .regular)
-                    Text("\(net.band) GHz · ch \(net.channel)")
-                        .font(.caption2).foregroundColor(.secondary)
-                }
-                Spacer()
-                if net.saved {
-                    Image(systemName: "key.fill").font(.caption2).foregroundColor(.secondary)
-                        .help("Saved network")
-                }
-                Image(systemName: "lock.fill").font(.caption2).foregroundColor(.secondary)
-                signalBars
+        HStack(spacing: 8) {
+            Image(systemName: isCurrent ? "checkmark.circle.fill" : "wifi")
+                .foregroundColor(isCurrent ? .green : .primary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(net.ssid).fontWeight(isCurrent ? .semibold : .regular)
+                Text("\(net.band) GHz · ch \(net.channel)")
+                    .font(.caption2).foregroundColor(.secondary)
             }
-            .contentShape(Rectangle())
+            Spacer()
+            if net.secure {
+                Image(systemName: "lock.fill").font(.caption2).foregroundColor(.secondary)
+                    .help("Password protected")
+            }
+            signalBars
+            if !isCurrent {
+                if net.saved {
+                    // bin icon = forget (replaces the old "Forget" button / context menu)
+                    Button { onForget() } label: { Image(systemName: "trash") }
+                        .buttonStyle(.borderless).controlSize(.small)
+                        .foregroundColor(.secondary).help("Forget this network")
+                }
+                if joinable {
+                    // inline Connect on the row itself. For a secure+unsaved network this
+                    // opens the password panel below; otherwise it connects immediately.
+                    Button(isExpanded ? "Cancel" : "Connect") { onConnect() }
+                        .controlSize(.small).disabled(busy)
+                } else {
+                    Text("WPA2 only").font(.caption2).foregroundColor(.secondary)
+                        .help("Open networks aren't supported yet")
+                }
+            }
         }
-        .buttonStyle(.plain)
+        .padding(.vertical, 1)
+        .contentShape(Rectangle())
     }
     var signalBars: some View {
         HStack(spacing: 1) {
@@ -284,10 +375,53 @@ struct NetRow: View {
     }
 }
 
+/// password entry shown below a secure, unsaved row when its Connect is pressed:
+/// field + show/hide eye + remember + Join.
+struct PasswordPanel: View {
+    @Binding var password: String
+    @Binding var showPassword: Bool
+    @Binding var remember: Bool
+    let error: String?
+    let onJoin: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Group {
+                    if showPassword { TextField("Password", text: $password) }
+                    else            { SecureField("Password", text: $password) }
+                }
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { onJoin() }
+                Button { showPassword.toggle() } label: {
+                    Image(systemName: showPassword ? "eye.slash" : "eye")
+                }
+                .buttonStyle(.plain)
+                .help(showPassword ? "Hide password" : "Show password")
+            }
+            HStack {
+                Toggle("Remember this network", isOn: $remember)
+                    .font(.caption).toggleStyle(.checkbox)
+                Spacer()
+                Button("Join") { onJoin() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(password.isEmpty)
+            }
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundColor(.orange).lineLimit(2)
+            }
+        }
+        .padding(.vertical, 4).padding(.leading, 24)
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var vm: WifiVM
     @State private var selected: WifiNet? = nil
     @State private var password: String = ""
+    @State private var showPassword: Bool = false
+    @State private var remember: Bool = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -296,7 +430,7 @@ struct ContentView: View {
                 Spacer()
                 if vm.busy { ProgressView().controlSize(.small) }
                 Button { vm.scan() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.plain).help("Scan").disabled(!vm.powered)
+                    .buttonStyle(.plain).help("Scan").disabled(!vm.powered || vm.busy)
                 // Wi-Fi power switch (separate from connect): off tears down the link
                 Toggle("", isOn: Binding(get: { vm.powered }, set: { vm.setPower($0) }))
                     .labelsHidden().toggleStyle(.switch).controlSize(.small).help("Wi-Fi power")
@@ -307,90 +441,144 @@ struct ContentView: View {
                 Label("Wi-Fi is off", systemImage: "wifi.slash").foregroundColor(.secondary)
                 Text("Turn it on with the switch above.").font(.caption2).foregroundColor(.secondary)
             } else {
-            if let ssid = vm.connectedSSID {
-                HStack {
-                    Image(systemName: "wifi").foregroundColor(.green)
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text("Connected: \(ssid)").font(.subheadline).fontWeight(.semibold)
-                        Text("\(vm.ifname)\(vm.ip.isEmpty ? "" : " · \(vm.ip)")")
-                            .font(.caption2).foregroundColor(.secondary)
+                if let ssid = vm.connectedSSID {
+                    HStack {
+                        Image(systemName: "wifi").foregroundColor(.green)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text("Connected: \(ssid)").font(.subheadline).fontWeight(.semibold)
+                            Text("\(vm.ifname)\(vm.ip.isEmpty ? "" : " · \(vm.ip)")")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Button("Disconnect") { vm.disconnect() }.controlSize(.small)
                     }
-                    Spacer()
-                    Button("Disconnect") { vm.disconnect() }.controlSize(.small)
+                    Divider()
                 }
-                Divider()
-            }
 
-            if !vm.daemonUp {
-                Label("rtwd not running (sudo rtwd / load the LaunchDaemon)", systemImage: "exclamationmark.triangle")
-                    .font(.caption).foregroundColor(.orange)
-            }
+                if !vm.daemonUp {
+                    Label("rtwd not running (sudo rtwd / load the LaunchDaemon)",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundColor(.orange)
+                }
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(vm.nets) { net in
-                        NetRow(net: net, isCurrent: net.ssid == vm.connectedSSID) {
-                            if net.ssid == vm.connectedSSID { return }
-                            if net.saved {
-                                // known network: rtwd supplies the saved password
-                                selected = nil; vm.connect(net.ssid, "")
-                            } else if selected?.id == net.id {
-                                selected = nil
-                            } else {
-                                selected = net; password = ""
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(vm.nets) { net in
+                            let expanded = selected?.id == net.id
+                            NetRow(net: net,
+                                   isCurrent: net.ssid == vm.connectedSSID,
+                                   isExpanded: expanded,
+                                   busy: vm.busy,
+                                   onConnect: {
+                                       if net.ssid == vm.connectedSSID { return }
+                                       if net.secure && !net.saved {
+                                           // toggle the inline password panel
+                                           if expanded { selected = nil }
+                                           else { selected = net; password = ""; showPassword = false
+                                                  remember = true; vm.lastError = nil }
+                                       } else {
+                                           // saved (secure) -> connect with the saved password now
+                                           selected = nil
+                                           vm.connect(net.ssid, "")
+                                       }
+                                   },
+                                   onForget: { vm.forget(net.ssid); if expanded { selected = nil } })
+                            if expanded && net.secure && !net.saved && net.ssid != vm.connectedSSID {
+                                PasswordPanel(password: $password,
+                                              showPassword: $showPassword,
+                                              remember: $remember,
+                                              error: vm.lastError,
+                                              onJoin: { vm.connect(net.ssid, password, remember: remember) })
                             }
                         }
-                        .contextMenu {
-                            if net.saved {
-                                Button("Forget Network") { vm.forget(net.ssid) }
-                            }
-                        }
-                        // password entry only for UNSAVED networks
-                        if selected?.id == net.id && !net.saved && net.ssid != vm.connectedSSID {
-                            HStack(spacing: 6) {
-                                SecureField("Password", text: $password)
-                                    .textFieldStyle(.roundedBorder)
-                                    .onSubmit { connectSelected(net) }
-                                Button("Join") { connectSelected(net) }
-                                    .keyboardShortcut(.defaultAction)
-                            }
-                            .padding(.vertical, 2).padding(.leading, 24)
+                        if vm.nets.isEmpty && !vm.busy {
+                            Text("No networks — press ⟳ to scan.")
+                                .font(.caption).foregroundColor(.secondary)
+                                .padding(.vertical, 8)
                         }
                     }
                 }
-            }
-            .frame(maxHeight: 280)
+                .frame(maxHeight: 300)
             }   // end: powered
 
             Divider()
             HStack {
                 Text(vm.status).font(.caption2).foregroundColor(.secondary).lineLimit(1)
                 Spacer()
+                Button("Quit") { NSApp.terminate(nil) }
+                    .buttonStyle(.plain).font(.caption2).foregroundColor(.secondary)
             }
         }
         .padding(10)
         .frame(width: 320)
         // no auto-scan on open — the Scan button (top-right) triggers it.
-        .onAppear { vm.startPolling(); vm.refreshStatus() }
-    }
-
-    func connectSelected(_ net: WifiNet) {
-        vm.connect(net.ssid, password)
-        selected = nil; password = ""
+        .onAppear { vm.refreshStatus() }
     }
 }
 
-// MARK: - app
+// MARK: - app shell (AppKit: status item + anchored popover)
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    private var statusItem: NSStatusItem!
+    private var popover: NSPopover!
+    private let vm = WifiVM()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem.button {
+            button.image = NSImage(systemSymbolName: "wifi.slash",
+                                   accessibilityDescription: "RTW88 Wi-Fi")
+            button.action = #selector(togglePopover(_:))
+            button.target = self
+        }
+
+        popover = NSPopover()
+        popover.behavior = .transient        // closes on outside click, like the system Wi-Fi menu
+        popover.delegate = self
+        popover.contentViewController = NSHostingController(rootView: ContentView(vm: vm))
+
+        // icon reflects reality from launch (poll-driven), not from first click
+        vm.onStateChange = { [weak self] in self?.updateIcon() }
+        vm.startPolling()
+        DispatchQueue.global().async { [vm] in vm.fetchStatus() }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        vm.stopPolling()
+    }
+
+    private func updateIcon() {
+        let name = !vm.powered ? "wifi.slash" : (vm.connected ? "wifi" : "wifi.exclamationmark")
+        statusItem.button?.image = NSImage(systemSymbolName: name,
+                                           accessibilityDescription: "RTW88 Wi-Fi")
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            // Anchoring to the status button keeps the popover attached to the icon
+            // even when the menu bar overlays a full-screen space (it only appears
+            // while the bar is revealed, exactly like the system menus).
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+}
 
 @main
-struct RTW88MenuApp: App {
-    @StateObject private var vm = WifiVM()
-    var body: some Scene {
-        MenuBarExtra {
-            ContentView(vm: vm)
-        } label: {
-            Image(systemName: vm.connected ? "wifi" : "wifi.slash")
-        }
-        .menuBarExtraStyle(.window)
+enum RTW88MenuMain {
+    @MainActor static var delegate: AppDelegate?   // NSApplication.delegate is unretained
+
+    @MainActor static func main() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)   // menu-bar only (matches LSUIElement)
+        let d = AppDelegate()
+        delegate = d
+        app.delegate = d
+        app.run()
     }
 }

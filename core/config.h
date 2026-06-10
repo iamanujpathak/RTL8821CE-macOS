@@ -1,10 +1,11 @@
 /*
- * config.h — runtime configuration for RTW88Client.
+ * config.h — saved networks + settings shared by the rtwd daemon (which loads,
+ * saves and matches them) and the in-kext session state.
  *
- * Nothing network-specific is hardcoded. A config file and/or CLI flags supply
- * one or MORE known networks (SSID + passphrase); at run time the client scans
- * and joins the strongest network that matches one it has credentials for — so
- * the same binary + config roams across home/office/phone-hotspot.
+ * Nothing network-specific is hardcoded. The config file supplies one or MORE
+ * known networks (SSID + passphrase); at run time the daemon scans and joins
+ * the strongest network it has credentials for — so the same config roams
+ * across home/office/phone-hotspot.
  */
 #ifndef RTW88_CONFIG_H
 #define RTW88_CONFIG_H
@@ -43,10 +44,6 @@ struct wifi_session {
     unsigned char init_rate;  /* DESC_RATE* initial hint placed in TX descriptors */
 };
 extern struct wifi_session g_session;
-
-/* Parse a config file then CLI flags (CLI wins). Returns 0 to proceed, 1 to
- * exit cleanly (e.g. --help), -1 on a usage error. */
-int parse_args(int argc, char **argv);
 
 /* If `ssid` is one of the configured networks, return its entry (with the
  * passphrase); else NULL. Used to pick a join target from the scan results. */

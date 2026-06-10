@@ -127,16 +127,29 @@ int trx_init(struct rtw_dev *rtwdev)
 
     /* ---- TX packet buffer (desc + up to a 4K fw chunk) ---- */
     g_pkt_size = 0x2000;
-    if (hw_dma_alloc(g_pkt_size, &g_pkt_handle, &g_pkt_paddr, (void **)&g_pkt_vaddr))
-        { rtw_err(rtwdev, "TX pkt alloc failed"); return -1; }
+    if (hw_dma_alloc(g_pkt_size, &g_pkt_handle, &g_pkt_paddr, (void **)&g_pkt_vaddr)) {
+        rtw_err(rtwdev, "TX pkt alloc failed");
+        /* free what this call already allocated — orphaned handles burn the bridge's
+         * 16-slot DMA pool across bring-up retries until it is exhausted. Clear the
+         * per-queue BD pointers too: they index into g_txbd_vaddr, so they must not
+         * outlive it (keeps the g_txbd_vaddr/g_tx[].bd set-together invariant). */
+        hw_dma_free(g_txbd_handle, g_txbd_vaddr, g_txbd_size); g_txbd_vaddr = NULL;
+        for (int q = 0; q < RTK_MAX_TX_QUEUE_NUM; q++) g_tx[q].bd = NULL;
+        return -1;
+    }
 
     /* ---- per-slot TX buffer pool for the in-kext data path (one slot per BE BD) ----
      * allocate-once + handed off by handle (see trx_fill_data_cfg); the kext borrows
      * it and never frees it, so a queued BE BD's in-flight DMA read can only ever land
      * in our own still-wired memory. */
     g_txpool_size = (u64)g_tx[RTW_TX_QUEUE_BE].len * RTW_ETH_SLOT_SIZE;
-    if (hw_dma_alloc(g_txpool_size, &g_txpool_handle, &g_txpool_paddr, (void **)&g_txpool_vaddr))
-        { rtw_err(rtwdev, "TX pool alloc failed"); return -1; }
+    if (hw_dma_alloc(g_txpool_size, &g_txpool_handle, &g_txpool_paddr, (void **)&g_txpool_vaddr)) {
+        rtw_err(rtwdev, "TX pool alloc failed");
+        hw_dma_free(g_pkt_handle, g_pkt_vaddr, g_pkt_size);     g_pkt_vaddr = NULL;
+        hw_dma_free(g_txbd_handle, g_txbd_vaddr, g_txbd_size);  g_txbd_vaddr = NULL;
+        for (int q = 0; q < RTK_MAX_TX_QUEUE_NUM; q++) g_tx[q].bd = NULL;
+        return -1;
+    }
     memset(g_txpool_vaddr, 0, g_txpool_size);
 
     /* ---- RX ring: BDs + a contiguous data pool (OPTIONAL — fw download needs
@@ -260,6 +273,7 @@ int trx_tx_mgmt(struct rtw_dev *rtwdev, const u8 *frame, u32 len, u8 rate, int b
 {
     u32 desc_sz = rtwdev->chip->tx_pkt_desc_sz;   /* 48 */
     u32 total   = len + desc_sz;
+    if (!g_pkt_vaddr || !g_tx[RTW_TX_QUEUE_MGMT].bd) return -1;   /* rings not allocated */
     if (total > g_pkt_size) { rtw_err(rtwdev, "mgmt frame too big"); return -1; }
 
     memset(g_pkt_vaddr, 0, desc_sz);
@@ -292,82 +306,37 @@ int trx_tx_mgmt(struct rtw_dev *rtwdev, const u8 *frame, u32 len, u8 rate, int b
 
     ring->wp = (ring->wp + 1) % ring->len;
     hw_write16(RTK_PCI_TXBD_IDX_MGMTQ, (u16)(ring->wp & 0xfff));   /* doorbell */
-
-    /* one-shot diagnostic: did the chip dequeue the BD? (hw idx should reach wp) */
-    static int diag = 0;
-    if (!diag) {
-        diag = 1;
-        usleep(3000);
-        u32 idx = hw_read32(RTK_PCI_TXBD_IDX_MGMTQ);
-        printf("  [TXdiag] MGMT IDX host=%u hw=%u | CR=0x%02x TXPAUSE=0x%04x cnt=0x%08x\n",
-               idx & 0xfff, (idx >> 16) & 0xfff, hw_read8(REG_CR),
-               hw_read16(REG_TXPAUSE), hw_read32(0x0664) /* REG_TX OK cnt-ish */);
-    }
     return 0;
 }
 
-/* Send an 802.11 DATA frame via the BE queue (for EAPOL / data). sec=0 means no
- * hardware encryption (the 4-way handshake frames go out in the clear).
- *
- * CCMP note (sec_type==3): upstream rtw88 sets IEEE80211_KEY_FLAG_GENERATE_IV, so
- * the *driver* supplies the 8-byte CCMP header (IV + 48-bit PN) in the frame and
- * the hardware only encrypts the payload + appends the 8-byte MIC. We therefore
- * insert an incrementing-PN CCMP header right after the 802.11 MAC header; the
- * over-the-air size grows by 8 (IV). The hardware adds the MIC, not counted here. */
-int trx_tx_data(struct rtw_dev *rtwdev, const u8 *frame, u32 len, u8 rate, u8 qsel, u8 sec_type)
+/* Send an in-clear 802.11 DATA frame via the BE queue (the EAPOL handshake frames).
+ * Bulk CCMP data never comes through here — the kext's in-kernel data path
+ * (RTW88Server.cpp txEthFrame) owns encrypted TX once the link is up. */
+int trx_tx_data(struct rtw_dev *rtwdev, const u8 *frame, u32 len, u8 rate)
 {
-    static u64 g_ccmp_pn = 1;                     /* TX packet number, must increase */
     u32 desc_sz = rtwdev->chip->tx_pkt_desc_sz;   /* 48 */
+    if (!g_pkt_vaddr || !g_tx[RTW_TX_QUEUE_BE].bd) return -1;   /* rings not allocated */
     u8 *body = g_pkt_vaddr + desc_sz;
-    u32 air_len = len;                            /* bytes the chip reads after desc */
 
-    if (sec_type == 3) {
-        /* header length: 24, +2 for QoS data (subtype bit 7 of the data type) */
-        u16 fc = (u16)(frame[0] | (frame[1] << 8));
-        u32 hdr_len = 24 + (((fc & 0x0c) == 0x08 && (fc & 0x80)) ? 2 : 0);
-        u64 pn = g_ccmp_pn++;
-        u8 keyid = 0;
-        if (desc_sz + len + 8 > g_pkt_size) { rtw_err(rtwdev, "data frame too big"); return -1; }
-        memset(g_pkt_vaddr, 0, desc_sz);
-        memcpy(body, frame, hdr_len);             /* 802.11 header */
-        u8 *iv = body + hdr_len;                  /* 8-byte CCMP header */
-        iv[0] = (u8)(pn);          iv[1] = (u8)(pn >> 8);
-        iv[2] = 0;                 iv[3] = 0x20 | (keyid << 6);   /* ExtIV bit set */
-        iv[4] = (u8)(pn >> 16);    iv[5] = (u8)(pn >> 24);
-        iv[6] = (u8)(pn >> 32);    iv[7] = (u8)(pn >> 40);
-        memcpy(iv + 8, frame + hdr_len, len - hdr_len);  /* payload */
-        air_len = len + 8;
-    } else {
-        if (desc_sz + len > g_pkt_size) { rtw_err(rtwdev, "data frame too big"); return -1; }
-        memset(g_pkt_vaddr, 0, desc_sz);
-        memcpy(body, frame, len);
-    }
-    u32 total = air_len + desc_sz;
+    if (desc_sz + len > g_pkt_size) { rtw_err(rtwdev, "data frame too big"); return -1; }
+    memset(g_pkt_vaddr, 0, desc_sz);
+    memcpy(body, frame, len);
+    u32 total = len + desc_sz;
 
-    /* Encrypted bulk data (CCMP) -> let the firmware rate-adaptation pick the rate
-     * (USE_RATE/DISDATAFB cleared, MACID+RATE_ID set so the fw uses the per-peer RA
-     * table programmed by fw_ra_info). `rate` becomes only the initial hint. EAPOL
-     * and in-clear frames (sec_type 0) stay pinned for handshake reliability. */
-    int use_ra = (sec_type == 3);
-    /* RATE_ID (raid) must match the MODULATION of the rate we transmit. For RA-driven
-     * bulk CCMP data use the negotiated per-peer raid; for a fixed-rate frame (the
-     * EAPOL handshake, sec_type 0) pick the raid by rate exactly like the working mgmt
-     * path (trx_tx_mgmt): CCK raid for CCK rates (1/2/5.5/11M < 6M), OFDM raid above.
+    /* Pinned rate for handshake reliability (USE_RATE | DISDATAFB). RATE_ID (raid)
+     * must match the MODULATION of the pinned rate, exactly like the working mgmt path
+     * (trx_tx_mgmt): CCK raid for CCK rates (1/2/5.5/11M < 6M), OFDM raid above.
      * Stamping raid 0 here mis-keyed CCK EAPOL frames (2.4GHz M2 at 1M) so they didn't
      * radiate reliably — the AP never saw M2 and never sent M3 ("no valid M3"). */
-    u8  rate_id = use_ra ? g_session.raid
-                         : (rate < DESC_RATE6M ? RTW_RATEID_B_20M : RTW_RATEID_G);
+    u8  rate_id = (rate < DESC_RATE6M) ? RTW_RATEID_B_20M : RTW_RATEID_G;
     u32 *w = (u32 *)g_pkt_vaddr;
-    w[0] = le32_encode_bits(air_len, RTW_TX_DESC_W0_TXPKTSIZE) |
+    w[0] = le32_encode_bits(len, RTW_TX_DESC_W0_TXPKTSIZE) |
            le32_encode_bits(desc_sz, RTW_TX_DESC_W0_OFFSET) |
            le32_encode_bits(1, RTW_TX_DESC_W0_LS);
-    w[1] = le32_encode_bits(qsel, RTW_TX_DESC_W1_QSEL) |
-           le32_encode_bits(sec_type, RTW_TX_DESC_W1_SEC_TYPE) |
-           le32_encode_bits(rate_id, RTW_TX_DESC_W1_RATE_ID);  /* MACID 0 implicit */
-    if (!use_ra)
-        w[3] = le32_encode_bits(1, RTW_TX_DESC_W3_USE_RATE) |
-               le32_encode_bits(1, RTW_TX_DESC_W3_DISDATAFB);
-    w[4] = le32_encode_bits(rate, RTW_TX_DESC_W4_DATARATE);          /* init hint */
+    w[1] = le32_encode_bits(rate_id, RTW_TX_DESC_W1_RATE_ID);  /* QSEL=BE(0), MACID 0, sec 0 */
+    w[3] = le32_encode_bits(1, RTW_TX_DESC_W3_USE_RATE) |
+           le32_encode_bits(1, RTW_TX_DESC_W3_DISDATAFB);
+    w[4] = le32_encode_bits(rate, RTW_TX_DESC_W4_DATARATE);
     w[8] = le32_encode_bits(1, RTW_TX_DESC_W8_EN_HWSEQ);
 
     struct tx_ring *ring = &g_tx[RTW_TX_QUEUE_BE];
@@ -376,7 +345,7 @@ int trx_tx_data(struct rtw_dev *rtwdev, const u8 *frame, u32 len, u8 rate, u8 qs
     *(u16 *)(bd + 0) = cpu_to_le16((u16)desc_sz);
     *(u16 *)(bd + 2) = cpu_to_le16((u16)psb_len);
     *(u32 *)(bd + 4) = cpu_to_le32((u32)g_pkt_paddr);
-    *(u16 *)(bd + 8) = cpu_to_le16((u16)air_len);
+    *(u16 *)(bd + 8) = cpu_to_le16((u16)len);
     *(u16 *)(bd + 10) = 0;
     *(u32 *)(bd + 12) = cpu_to_le32((u32)(g_pkt_paddr + desc_sz));
 
@@ -392,6 +361,7 @@ int trx_tx_h2c(struct rtw_dev *rtwdev, const u8 *pkt)
     u32 desc_sz = rtwdev->chip->tx_pkt_desc_sz;   /* 48 */
     u32 len = 32;                                  /* H2C_PKT_SIZE */
     u32 total = len + desc_sz;
+    if (!g_pkt_vaddr || !g_tx[RTW_TX_QUEUE_H2C].bd) return -1;   /* rings not allocated */
     if (total > g_pkt_size) return -1;
 
     memset(g_pkt_vaddr, 0, desc_sz);
@@ -399,7 +369,12 @@ int trx_tx_h2c(struct rtw_dev *rtwdev, const u8 *pkt)
 
     u32 *w = (u32 *)g_pkt_vaddr;
     w[0] = le32_encode_bits(len, RTW_TX_DESC_W0_TXPKTSIZE) |
-           le32_encode_bits(desc_sz, RTW_TX_DESC_W0_OFFSET);
+           le32_encode_bits(desc_sz, RTW_TX_DESC_W0_OFFSET) |
+           le32_encode_bits(1, RTW_TX_DESC_W0_LS);   /* Last Segment: without it the MAC never
+                                                      * completes the packet to the MCU, so every
+                                                      * H2C (general_info/phydm_info/IQK) is dropped.
+                                                      * Both working paths (mgmt + fw-download) and
+                                                      * upstream rtw_tx_fill_tx_desc set LS=1. */
     w[1] = le32_encode_bits(TX_DESC_QSEL_H2C, RTW_TX_DESC_W1_QSEL);
 
     struct tx_ring *ring = &g_tx[RTW_TX_QUEUE_H2C];
@@ -457,4 +432,23 @@ void trx_free(void)
     hw_write8(REG_CR, 0);                      /* stop MAC TRX DMA engines */
     hw_power(true, false);                     /* disable PCI bus mastering */
     usleep(30000);                             /* let any in-flight DMA drain */
+}
+
+/* Called by RTW88Server::stop() AFTER it released every DMA buffer: the handles and
+ * vaddrs cached here now point at freed slots, so clear the allocate-once bookkeeping.
+ * Without this, a stop()/start() cycle that does not unload the kext leaves
+ * g_trx_alloced=1 and the next trx_init "reuses" freed memory (writes through a freed
+ * mapping in trx_write_data_rsvd_page, silently unprogrammed rings). */
+void trx_unload_reset(void)
+{
+    g_trx_alloced = 0;
+    g_rx_ok = 0;
+    g_txbd_vaddr = NULL;  g_pkt_vaddr = NULL;  g_rxbd_vaddr = NULL;
+    g_rxdata_vaddr = NULL; g_txpool_vaddr = NULL;
+    g_txbd_handle = g_pkt_handle = g_rxbd_handle = g_rxdata_handle = g_txpool_handle = 0;
+    /* zero the sizes too: a TX leaf's only sanity guard is `total > g_pkt_size`, so a
+     * stale g_pkt_size would let it write through the now-NULL g_pkt_vaddr */
+    g_txbd_size = g_pkt_size = g_txpool_size = 0;
+    g_rx_n = 0;
+    for (int q = 0; q < RTK_MAX_TX_QUEUE_NUM; q++) g_tx[q].bd = NULL;
 }

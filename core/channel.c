@@ -226,14 +226,43 @@ static void set_channel_bb_swing(struct rtw_dev *rtwdev, u8 channel)
     rtw_write32_mask(rtwdev, REG_TXSCALE_A, GENMASK(31, 21), 0x200);
 }
 
+/* CCK TX-filter params cached ONCE from the BB-table defaults. Caching on every
+ * set_channel call (as before) re-reads the registers AFTER a channel-14 tune has
+ * overwritten them with the ch14-only values, poisoning the filter for ch1-13 for
+ * the rest of the session. File-scope (not per-rtw_dev): the BB table is reloaded
+ * with identical defaults on every bring-up, so the first-call snapshot stays valid. */
+static u32 g_ch_param[3];
+static int g_ch_param_valid;
+
 /* rtw8821c_set_channel (rtw8821c.c, verbatim) */
 void set_channel(struct rtw_dev *rtwdev, u8 channel, u8 bw, u8 primary_ch_idx)
 {
     struct rtw_hal_min *hal = &rtwdev->hal;
-    /* cache CCK TX-filter params from the BB-table defaults (phy_set_param tail) */
-    hal->ch_param[0] = hw_read32(REG_TXSF2);
-    hal->ch_param[1] = hw_read32(REG_TXSF6);
-    hal->ch_param[2] = hw_read32(REG_TXFILTER);
+    if (!g_ch_param_valid) {
+        u32 a = hw_read32(REG_TXSF2), b = hw_read32(REG_TXSF6), c = hw_read32(REG_TXFILTER);
+        /* Only latch once we read plausible BB-table defaults. If set_channel runs before
+         * phy_set_param loaded the BB table (or after a failed bring-up), these read 0 or
+         * 0xffffffff — latching that garbage would poison the CCK TX filter for the whole
+         * kext lifetime (cache-once). Skip until the table is present; channel 14 then
+         * uses its own hard-coded params, and 1-13 fall back to the live (table) values. */
+        if (a && a != 0xffffffff && c && c != 0xffffffff) {
+            g_ch_param[0] = a; g_ch_param[1] = b; g_ch_param[2] = c;
+            g_ch_param_valid = 1;
+        } else {
+            g_ch_param[0] = a; g_ch_param[1] = b; g_ch_param[2] = c;   /* use live values, re-read next time */
+        }
+    }
+    hal->ch_param[0] = g_ch_param[0];
+    hal->ch_param[1] = g_ch_param[1];
+    hal->ch_param[2] = g_ch_param[2];
+
+    /* 80MHz is NOT ported: set_channel_bb has no 80MHz ADC-clock case, so a WIDTH_80
+     * request would silently program a 20MHz ADC against an 80MHz RF/rxdfir setup.
+     * Refuse loudly and run 20MHz until the 80MHz baseband path lands. */
+    if (bw == RTW_CHANNEL_WIDTH_80) {
+        rtw_warn(rtwdev, "set_channel: 80MHz not ported — falling back to 20MHz");
+        bw = RTW_CHANNEL_WIDTH_20;
+    }
 
     set_channel_bb(rtwdev, channel, bw, primary_ch_idx);
     set_channel_bb_swing(rtwdev, channel);
@@ -249,32 +278,3 @@ void set_channel(struct rtw_dev *rtwdev, u8 channel, u8 bw, u8 primary_ch_idx)
     rtw_write32(rtwdev, 0x1d08, 0x28282828);  /* OFDM 24/36/48/54  */
 }
 
-/* ---- RX enable + poll ---------------------------------------------------- */
-#define BIT_AAP BIT(0)   /* accept all (promiscuous) */
-#define BIT_AM  BIT(2)
-#define BIT_AB  BIT(3)
-
-/* poll the RX BD hw index for `ms`; returns frames observed. The hw index lives
- * in TRX_BD_HW_IDX_MASK (bits 27:16) of RTK_PCI_RXBD_IDX_MPDUQ. */
-int rx_scan(struct rtw_dev *rtwdev, u8 channel, u32 ms)
-{
-    /* promiscuous: accept beacons/broadcast from any BSSID */
-    rtw_write32_set(rtwdev, REG_RCR, BIT_AAP | BIT_AB | BIT_AM);
-
-    set_channel(rtwdev, channel, RTW_CHANNEL_WIDTH_20, 0);
-    printf("  channel set to %u (2.4GHz, BW20); RX promiscuous; polling %ums...\n", channel, ms);
-
-    u32 last_hw = (hw_read32(RTK_PCI_RXBD_IDX_MPDUQ) >> 16) & 0xfff;
-    u32 frames = 0;
-    for (u32 t = 0; t < ms; t += 20) {
-        usleep_range(20000, 20000);
-        u32 hw = (hw_read32(RTK_PCI_RXBD_IDX_MPDUQ) >> 16) & 0xfff;
-        if (hw != last_hw) {
-            u32 d = (hw - last_hw) & 0xfff;
-            frames += d;
-            last_hw = hw;
-        }
-    }
-    (void)rtwdev;
-    return (int)frames;
-}

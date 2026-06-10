@@ -1,9 +1,9 @@
 name: Build & Release
 
-# Build the RTW88Server.kext + RTW88Client + rtwd + the RTW88Menu.app GUI on every
-# push to main and publish them, plus a one-download install bundle, as a Release.
-# Everything is x86_64 (the card is Intel-Mac/Hackintosh only); the macos-14 runner
-# is arm64 but every build step forces -arch/-target x86_64.
+# Build the RTW88Server.kext + the unified rtwd binary + the RTW88Menu.app GUI on
+# every push to main and publish them, plus a one-download install bundle, as a
+# Release. Everything is x86_64 (the card is Intel-Mac/Hackintosh only); the
+# macos-14 runner is arm64 but every build step forces -arch/-target x86_64.
 on:
   push:
     branches: [main]
@@ -18,10 +18,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Stamp the release version into the kext
+        # CFBundleVersion (Info.plist) and the kmod_info version string must match
+        # for the kext to load, so patch both. The loaded kext then reports the
+        # same 0.1.N as the release tag (kextstat correlates to the release).
+        run: |
+          set -e
+          VER="0.1.${{ github.run_number }}"
+          sed -i '' "s/<string>1\.0\.0<\/string>/<string>$VER<\/string>/g" server/Info.plist
+          sed -i '' "s/\"1\.0\.0\"/\"$VER\"/" server/kmod_info.c
+          grep -q "$VER" server/Info.plist && grep -q "$VER" server/kmod_info.c
+
       - name: Build RTW88Server.kext
         run: bash server/build.sh
 
-      - name: Build RTW88Client + rtwd
+      - name: Build rtwd (daemon + CLI)
         run: bash client/build.sh
 
       - name: Build RTW88Menu.app (menu-bar GUI)
@@ -30,9 +41,8 @@ jobs:
       - name: Verify everything is x86_64
         run: |
           set -e
-          file dist/RTW88Server.kext/Contents/MacOS/RTW88Server | grep -q x86_64
-          file build/client/RTW88Client                          | grep -q x86_64
-          file build/client/rtwd                                 | grep -q x86_64
+          file dist/RTW88Server.kext/Contents/MacOS/RTW88Server   | grep -q x86_64
+          file build/client/rtwd                                   | grep -q x86_64
           file build/client/RTW88Menu.app/Contents/MacOS/RTW88Menu | grep -q x86_64
 
       - name: Package artifacts + install bundle
@@ -40,28 +50,28 @@ jobs:
           set -e
           mkdir -p out
           # ad-hoc sign the bundles so they load locally (OpenCore needs no Developer ID)
-          codesign --force --sign - dist/RTW88Server.kext || true
-          codesign --force --deep --sign - build/client/RTW88Menu.app || true
+          codesign --force --sign - dist/RTW88Server.kext
+          codesign --force --deep --sign - build/client/RTW88Menu.app
 
           # ---- individual artifacts ----
           ditto -c -k --sequesterRsrc --keepParent dist/RTW88Server.kext        out/RTW88Server.kext.zip
           ditto -c -k --sequesterRsrc --keepParent build/client/RTW88Menu.app   out/RTW88Menu.app.zip
-          cp build/client/RTW88Client out/RTW88Client
-          cp build/client/rtwd        out/rtwd
-          chmod +x out/RTW88Client out/rtwd
+          cp build/client/rtwd out/rtwd
+          chmod +x out/rtwd
 
           # ---- one-download install bundle (prebuilt; copy-only installer) ----
           B=out/RTW88-macOS
           mkdir -p "$B"
           cp -R dist/RTW88Server.kext        "$B/"
           cp -R build/client/RTW88Menu.app   "$B/"
-          cp build/client/RTW88Client build/client/rtwd "$B/"
+          cp build/client/rtwd               "$B/"
           cp dist/install-bundle.sh          "$B/install.sh"
-          cp dist/com.rtw88.client.plist     "$B/"
+          cp dist/uninstall.sh               "$B/uninstall.sh"
           cp dist/com.rtw88.rtwd.plist       "$B/"
+          cp dist/com.rtw88.menu.plist       "$B/"
           cp dist/rtw88-eth-netcfg.sh        "$B/"
           cp client/rtw88.conf.example       "$B/"
-          chmod +x "$B/RTW88Client" "$B/rtwd" "$B/install.sh" "$B/rtw88-eth-netcfg.sh"
+          chmod +x "$B/rtwd" "$B/install.sh" "$B/uninstall.sh" "$B/rtw88-eth-netcfg.sh"
           ditto -c -k --sequesterRsrc --keepParent "$B" out/RTW88-macOS.zip
 
       - name: Create GitHub Release
@@ -77,15 +87,15 @@ jobs:
             '**One-download install:** grab `RTW88-macOS.zip`, unzip, then:' \
             '- GUI (menu-bar app): `sudo bash install.sh --gui`' \
             '- Headless (auto-connect from config): `sudo bash install.sh`' \
+            '- Uninstall: `sudo bash uninstall.sh`' \
             '' \
             'First kext install needs approval in System Settings > Privacy & Security, then one reboot.' \
-            'Individual artifacts (kext, RTW88Menu.app, RTW88Client, rtwd) are also attached.' \
+            'Individual artifacts (kext, RTW88Menu.app, rtwd) are also attached.' \
             > out/NOTES.md
           gh release create "$TAG" \
             out/RTW88-macOS.zip \
             out/RTW88Server.kext.zip \
             out/RTW88Menu.app.zip \
-            out/RTW88Client \
             out/rtwd \
             --title "RTW88 $TAG" \
             --target "${{ github.sha }}" \
